@@ -18,6 +18,7 @@ To run this pipeline, you must have the following additional data sets:
 
 1) Field notes
 2) A yaml containing your HydroVu credentials
+3) A yaml containing your mWater credentials
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, warnings = 'hide', error = FALSE, message = 'hide')
@@ -29,6 +30,7 @@ source("src/package_loader.R")
 lapply(c("data.table", "tidyverse", "rvest", "readxl", "lubridate", "zoo", "padr", "stats",
          "plotly", "feather", "RcppRoll", "yaml", "ggpubr", "profvis", "janitor", "HydroVuR"), package_loader)
 
+# Load functions
 walk(list.files('src/', pattern = "*.R", full.names = TRUE, recursive = TRUE), source)
 ```
 
@@ -66,7 +68,7 @@ differently, and therefore should be treated differently.)*
 ```{r api}
 hv_creds <- read_yaml("creds/HydroVuCreds.yml")
 
-hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
+hv_token <- HydroVuR::hv_auth(client_id = as.character(hv_creds["client"]),
                     client_secret = as.character(hv_creds["secret"]),
                     url = "https://www.hydrovu.com/public-api/oauth/token")
 
@@ -89,7 +91,7 @@ hv_token <- hv_auth(client_id = as.character(hv_creds["client"]),
 
 hacky <- TRUE
 
-if(hacky == FALSE){
+if(hacky == FALSE){ # TODO: figure out when to use these two functions
   all_data <- munge_api_data(api_path = "data/api/krw_everything_backup2.0_mdt_dl/",
                              # select which sondes to download data from
                              network = "all",

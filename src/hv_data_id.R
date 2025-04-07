@@ -24,8 +24,8 @@ hv_data_id <- function(loc_id, start_time = startdate, end_time = enddate, tz = 
     }
 
     # get the params and units
-    params <- hv_names(token, return = "params")
-    units <- hv_names(token, return = "units")
+    params <- HydroVuR::hv_names(token, return = "params")
+    units <- HydroVuR::hv_names(token, return = "units")
 
     # collapse the paginated date and clean up
     df <- purrr::map_dfr(data, flatten_page_params) %>%

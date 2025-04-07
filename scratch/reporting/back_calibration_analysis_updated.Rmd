@@ -1,0 +1,125 @@
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(ggpubr)
+library(here)
+
+# set function directory paths
+fxn_path <- here("src")
+
+# Source functions
+invisible(map(
+  list.files(fxn_path, pattern = "*.R", full.names = TRUE),
+  ~ source(.x, echo = FALSE)
+))
+
+# load all the flagged data, pre verification
+flagged_data <- read_rds(here("data","virridy_verification","all_data_flagged_complete.RDS"))
+```
+
+```{r}
+# Make list of parameter specifications for joining
+unique_parameters <- names(flagged_data) %>% 
+  str_extract(pattern = "(?<=-).*") %>% 
+  unique(.)
+
+parameter_specifications <- tibble(
+  parameter = unique_parameters,
+  accuracy = list(
+    NA,
+    NA,
+    0.1,
+    NA,
+    5,
+    0.1,
+    c(0.5, 1, 2), # these are percentages
+    0.1,
+    2 # Percentage
+  ),
+  range = list(
+    NA,
+    NA,
+    c(0,20),
+    NA,
+    c(-1400,1400),
+    c(0,14),
+    list(c(0,100000), c(100000,200000), c(200000,350000)), # related ranges for percentages
+    c(-5,50), # in C
+    list(c(0,1000), c(1000,4000))
+  ),
+  precision = list(
+    NA,
+    NA,
+    0.01,
+    NA,
+    0.1,
+    0.01,
+    0.1,
+    0.01,
+    c(0.01,0.1)
+  )
+)
+```
+
+## Note on percent change vs percent difference:
+Percent change: 100*(new_value - old_value)/old_value
+  Used when tracking changes over time
+  Shows the direction of change
+  Uses the old value as a reference
+  Asymmetric
+  
+Percent difference: 100*(abs(new_value - old_value)/mean(new_value,old_value))
+  Used when you want to compare the relative difference between two independent values
+  Does not show the direction of change
+  uses the mean of both values as a reference
+  Symmetric
+```{r}
+flagged_data_altered <- map(flagged_data, function(df) {
+  
+  altered_df <- df %>% 
+    # select for the most relevant columns
+    select(DT_join, DT_round, site, parameter, mean, flag) %>% 
+    mutate(
+      # calculate difference
+      difference = mean - lag(mean),
+      # calculate percent change
+      percent_change = if_else(
+        mean != 0 & lag(mean) != 0, # prevent divide by 0 errors
+        ((mean-lag(mean))/lag(mean))*100,
+        NA_integer_),
+      # calculate percent difference
+      percent_difference = if_else(
+        mean != 0 & lag(mean) != 0, # prevent divide by 0 errors
+        (abs(mean-lag(mean))/((mean+lag(mean))/2))*100,
+        NA_integer_),
+      # center and scale the data for easy comparisons across sites
+      percent_change_standardized = (percent_change - mean(percent_change, na.rm = T))/sd(percent_change, na.rm = T),
+      percent_difference_standardized = (percent_difference - mean(percent_difference, na.rm = T))/sd(percent_difference, na.rm = T)
+    ) %>% 
+    left_join(parameter_specifications, by = "parameter")
+    
+  return(altered_df)
+})
+```
+
+```{r}
+flags <- paste0(c("site visit", "sv window"), collapse = "|")
+
+site_visit_data <- map(flagged_data_altered, function(df) {
+  altered_df <- df %>% 
+    filter((lag(grepl(flags, flag)) | lead(grepl(flags, flag))) &
+             !grepl(flags, flag))
+})
+```
+
+# Histograms
+extremely skewed data is hard to visualize
+```{r}
+# sensitivity for Turbidity
+
+# sensitivity for Chl-a
+
+# sensitivity for FDOM
+
+# extremely skewed data
+```

@@ -86,9 +86,17 @@ incoming_data_csvs_upload <- api_puller(site = c("Tamasag", "Legacy", "Lincoln",
                                         dump_dir = api_dump_dir,
                                         require = NULL)
 
+# `incoming_data_csvs_upload()` will upload a .csv file into the specified directory 
+# for each of the sites that you have selected that will have all of the parameters 
+# collated into a single file for that parameter
+
 # we will use `munge_API_data()` for the synapse workflow
 incoming_data_collated_csvs <- munge_api_data(api_path = api_dump_dir)
 all_data_df <- incoming_data_collated_csvs
+
+# `munge_API_data()` will load in all of the .csv files that were uploaded to the
+# dump directory via the `incoming_data_csvs_upload()` so that we are able to 
+# manipulate them in the future
 
 ```
 
@@ -135,7 +143,17 @@ all_data_tidied_list <- purrr::map2(
     # remove NULL from the list (indicating a site-param combo that doesn't actually exist)
     purrr::keep( ~ !is.null(.))
 )
+
+# `tidy_and_add_field_notes` takes the data that was pulled in and cleaned with
+# `munge_api_data` and groups it by site-parameter combinations that we are able 
+# to perform our QAQC on
 ```
+
+MVP: For the FC system bronze data we need to pull the raw data into a dump directory,
+then we will clean it up and group that data by site-parameter, and add the field notes to 
+it. 
+
+Focus on pulling in the raw data into the dump directory correctly in the FC system
 
 #### *Add summary stats*
 

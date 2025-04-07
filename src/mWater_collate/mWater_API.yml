@@ -1,0 +1,5 @@
+#URL to download data from mWater
+#THIS FILE SHOULD BE UNTRACKED
+#Check git status!
+
+url: 'https://api.mwater.co/v3/datagrids/b9cead1fa4004469a4c935f3a41b7681/download?client=837d7ce3e07620d1efee1b3141fc86e8&share='

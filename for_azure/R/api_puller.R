@@ -18,7 +18,7 @@
 
 api_puller <- function(site, start_dt, end_dt = Sys.time(), api_token, dump_dir) {
 
-  locs <- hv_locations_all(hv_token) %>%
+  locs <- hv_locations_all(hv_token) %>% # this should be 'api_token' arg
     dplyr::filter(!grepl("virridy", name, ignore.case = TRUE))
 
   # make a list of site names
@@ -66,6 +66,9 @@ api_puller <- function(site, start_dt, end_dt = Sys.time(), api_token, dump_dir)
       readr::write_csv(one_df,
                        here::here(dump_dir,
                                   paste0(site[i],"-", stringr::str_replace(stringr::str_replace(substr(end_dt, 1, 16), "[:\\s]", "_"), ":", ""), ".csv")))
+
+      # add an appending step here
+      ## 1. Check if there is a file present in the dump_dir that also has site[i] in it
 
     } else {
 

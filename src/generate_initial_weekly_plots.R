@@ -37,6 +37,7 @@ generate_initial_weekly_plots <- function(all_df_list, pending_df_list, site_arg
 
           # Get the relevant sonde data
           relevant_sondes <- map(plot_filter, ~ {
+
             sonde_name <- paste0(.x, "-", parameter_arg)
             data_source <- NULL
             sonde_df <- NULL
@@ -55,6 +56,7 @@ generate_initial_weekly_plots <- function(all_df_list, pending_df_list, site_arg
               tryCatch({
                 sonde_df <- get(data_source)[[sonde_name]] %>%
                   filter(y_w == group_data$y_w)
+
               }, error = function(err) {
                 cat("Sonde", sonde_name, "not found.\n")
                 return(NULL)  # Return NULL if sonde data can't be retrieved
@@ -63,7 +65,7 @@ generate_initial_weekly_plots <- function(all_df_list, pending_df_list, site_arg
 
             # Only return a list if both data_source and sonde_df are available
             if (!is.null(data_source) & !is.null(sonde_df)) {
-              return(list(sonde_df = sonde_df, data_source = data_source))
+              return(list(sonde_df = tibble(sonde_df), data_source = data_source))
             } else {
               return(NULL)  # Return NULL if either data_source or sonde_df is NULL
             }
@@ -76,7 +78,7 @@ generate_initial_weekly_plots <- function(all_df_list, pending_df_list, site_arg
           # append site_df to relevant sonde list, clean list, and bind dfs
           # to find plot info
           relevant_dfs <- map(relevant_sondes, ~.x[[1]])
-          week_plot_data <- append(relevant_dfs, list(site_df)) %>% # how to relevant sondes here
+          week_plot_data <- append(relevant_dfs, list(site_df)) %>%
             keep(~ !is.null(.)) %>%
             keep(~ nrow(.)>0) %>%
             bind_rows() %>%
@@ -102,7 +104,7 @@ generate_initial_weekly_plots <- function(all_df_list, pending_df_list, site_arg
               y_column <- if (data_source == "all_data") "mean" else "mean_verified"
 
               geom_line(data = data, aes(x = DT_round, y = .data[[y_column]], color = site))
-            })+
+            }) +
             geom_vline(xintercept = vline_dates, color = "black") +
             ggtitle(paste0(str_to_title(site_arg), " ", parameter_arg, " (", format(flag_day, "%B %d, %Y"), ")")) +
             theme(axis.text.x = element_text(angle = 45, hjust = 1)) +

@@ -1,15 +1,15 @@
 #' @title Combine historical and incoming data
-#' 
+#'
 #' @description
 #' A function that combines the subset of historically flagged data and creates historical columns.
 #' NOTE: historical columns should be a part of the historically flagged data, but it is not at this point.
-#' 
+#'
 #' @param incoming_data_list A list of dataframes with the incoming data.
-#' 
+#'
 #' @param historical_data_list A list of dataframes with the historical data.
-#' 
+#'
 #' @return A list of dataframes with the combined historical and incoming data.
-#' 
+#'
 #' @examples
 #' combine_hist_inc_data(incoming_data_list = incoming_data_list, historical_data_list = historical_data_list)
 
@@ -42,8 +42,7 @@ combine_hist_inc_data <- function(incoming_data_list, historical_data_list) {
       bind_rows(., mutate(incoming_data_list[[index]], historical = FALSE)[-1,]) %>% # why are we removing the first row? -jd # there is a datetime issue on this bind
       # make sure new data has info about last site visit, etc. filled out
       fill(c(sonde_employed, last_site_visit, sensor_malfunction))
-
-  }) %>%
+    }) %>%
     set_names(matching_indexes)
 
   return(combined_hist_inc_data)

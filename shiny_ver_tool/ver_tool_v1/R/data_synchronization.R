@@ -226,8 +226,8 @@ fix_duplicate_files <- function(dataframe_with_duplicate_info, directory){
 
 # In progress functions (pseudocode) ----
 # TODO: Connect front end decisions to back end functions
-# TODO: Make functions to move data around (different from the directory checks)
-# TODO: Make function to update intermediary data
+# TODO: finish functions to move data around (different from the directory checks)
+# TODO: finish function to update intermediary data
 # TODO: current split_filename function does not take into account the fact that
   # the files in the pre directory do not have hashes or datetimes in the file names
 # TODO: In the Shiny app, after moving a file, the app should reload the datasets

@@ -12,7 +12,7 @@
 
 load_old_field_notes <- function(filepath,  summarize_interval = "15 minutes"){
 
-  raw_field_notes <- readxl::read_excel(filepath)
+  raw_field_notes <- readxl::read_excel(filepath) # TODO: convert the old field notes to csv
 
   field_notes <- raw_field_notes %>%
     dplyr::mutate(start_DT = lubridate::ymd_hm(paste(date, start_time_mst), tz = "MST")) %>%

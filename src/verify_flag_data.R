@@ -337,7 +337,7 @@ verify_flag_data <- function(df_list_arg,
           }
 
           if (daily_verification_decision %in% simple_decision_list){
-            # browser()
+            #
             altered_df_list[[i]] <- alter_verification_column(daily_verification_decision, daily_plot_data) # this should get put in a list
           }
 
@@ -362,10 +362,10 @@ verify_flag_data <- function(df_list_arg,
 
     } else if (is.list(altered_df_list)) {
       if (!length(altered_df_list) %in% c(51,49,46)){
-        # browser()
+        #
         altered_df_list <- map(altered_df_list, function(df) {
           if(!is.null(df)) {
-            # browser()
+            #
             df %>%
               mutate(mean_verified = if_else(grepl(non_removable_flags, flag, ignore.case = TRUE), NA, mean_verified),
                      is_verified = TRUE,
@@ -373,7 +373,7 @@ verify_flag_data <- function(df_list_arg,
           }
         })
       } else {
-        # browser()
+        #
         altered_df_list <- altered_df_list %>%
           mutate(mean_verified = if_else(grepl(non_removable_flags, flag, ignore.case = TRUE), NA, mean_verified),
                  is_verified = TRUE,
