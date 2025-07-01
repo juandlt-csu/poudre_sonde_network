@@ -1,0 +1,69 @@
+---
+title: "fixing_calibrations"
+output: html_document
+---
+
+```{r}
+# Initialize Environment
+source(file.path("scratch","data_tidying","sensor_calibration","R","init_sub_env","init.R"))
+```
+
+# Extract and Organize Calibration Data
+```{r}
+# Grab all calibration file paths
+all_cal_file_paths <- list.files(here("data", "calibration_reports"), pattern = ".html", full.names = TRUE)
+
+# Grab all calibration file paths, sans vulink and virridy calibration files
+all_cal_file_paths <- all_cal_file_paths[!grepl("vulink|virridy", all_cal_file_paths)]
+
+# Get the site names for each of the calibrations that we pulled
+all_cal_site_names <- basename(all_cal_file_paths) %>%
+  str_split(., "_") %>%
+  map(\(str_list){str_list[1]}) %>%
+  unlist()
+```
+
+```{r}
+# Generate subset rule for the calibration names
+# Right now there is no rule.
+file_subset_rule <- grepl("/", all_cal_file_paths)
+```
+
+```{r}
+# Grab the file paths for the subset that you are interested in
+paths_subset <- all_cal_file_paths[file_subset_rule]
+
+# Subset the names of the sites based on the subset rule outcome
+subset_site_names <- basename(paths_subset) %>%
+  str_split(., "_") %>%
+  map(\(str_list){str_list[1]}) %>%
+  unlist()
+
+# Read in the subset of the calibration data
+subset_html <- map(paths_subset, read_html)
+```
+
+```{r}
+# Extract Calibration information of subset of data
+subset <- map2_dfr(.x = subset_html,
+                   .y = subset_site_names,
+                   ~cal_extract_markup_data(html_markup = .x, calibration_site  = .y))
+```
+
+```{r}
+# Clean up and organize calibration data into site-parameter combinations by year
+subset_split <- subset %>% 
+  mutate(
+    created = mdy(created),
+    last_calibrated = mdy(na_if(last_calibrated, "Factory Defaults"))
+  ) %>% 
+  split(f = year(.$created)) %>% 
+  map(\(year_data){
+    site_param_split_list <- year_data %>% 
+      filter(!(is.na(last_calibrated) & 
+         map_lgl(calibration_coefs, is.null) & 
+         map_lgl(driftr_input, is.null))) %>% 
+      split(f = list(.$calibration_site, .$sensor), sep = "-", drop = TRUE) %>%
+      discard(\(site_param_df) nrow(site_param_df) == 0) 
+  })
+```
