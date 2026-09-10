@@ -1,0 +1,882 @@
+---
+title: "burial_flag_method_comparison_jpd_09-10-26"
+output: html_document
+---
+
+# Motivation
+
+Our current DO burial detection is flagging good data as burials. The DO
+interference heuristics we came up with are too coarse to tell the
+difference between data that is just unusual and data that actually
+indicates a sonde burial. The heuristics check for two patterns in the DO
+signal and tag either one as "DO interference". The first is spikes in the
+data, which serve as an analog for increased variability in the signal. The
+second is "unrealistic" lows in the data, a depressed signal that is either
+not plausible or only possible as a reading because the DO sensor is buried
+and has limited access to moving oxygenated water. By combining these two
+signals we had previously been able to detect burials with reasonable
+precision and recall.
+
+The water year regimes we built these tools in had rarely if ever seen DO
+levels lower than 5 mg/L that were not burials, but 2026 has been an
+extremely anomalous year in terms of precipitation. As a result we have seen
+realistic values lower than 5 mg/L that trigger our DO burial heuristics and
+flag large swaths of correct data. Given that these functions are used in
+live environments with users who rely on the correctness of our flagging
+methods, we want to correct this behavior.
+
+# Data Loading and Environment Initialization
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(arrow)
+library(ross.wq.tools)
+library(plotly)
+library(here)
+library(slider)
+```
+
+We use 2023 through 2026. For 2023 to 2025 we use the published HydroShare
+`raw` files, which carry `user_qc_flag` (the human verification outcome, our
+ground truth) alongside `auto_qc_flag` (what the current auto-QAQC produced).
+2026 is not verified yet, so we pull it from the in-progress
+manual-verification directory. It has no `user_qc_flag`, so we set that column
+to NA and line the rest of the schema up with the older years. Column
+definitions are in `data/collated/sensor/hydroshare_pub/README.md` and the flag
+definitions in `CSU_ROSS_user_qc_flag_metadata.csv`. Earlier years are left out
+because they carry no site-visit information, which the updated method needs.
+
+```{r load-do}
+# 2023-2025: published HydroShare raw files
+do_hydro <- list.files(
+  here("data", "collated", "sensor", "hydroshare_pub"),
+  pattern = "CSU_ROSS_[0-9]{4}_raw\\.parquet$",
+  full.names = TRUE, recursive = TRUE
+) %>%
+  keep(~ as.integer(str_extract(basename(.x), "[0-9]{4}")) %in% 2023:2025) %>%
+  map(~ read_parquet(.x) %>% filter(parameter == "DO")) %>%
+  bind_rows() %>%
+  transmute(
+    site, parameter,
+    DT_round    = DateTime_UTC,
+    mean        = value_raw,
+    auto_flag   = auto_qc_flag,
+    mal_flag, user_qc_flag,
+    # ground truth: technician-verified burial. Catches "sonde burial" and
+    # "reported sonde burial" (field-note derived), not "Possible burial",
+    # which is the algorithm's own output.
+    user_burial = str_detect(replace_na(user_qc_flag, ""), "sonde burial")
+  )
+
+# 2026: in-progress manual-verification pull, one file per site-parameter
+raw_2026 <- list.files(
+  here("data", "raw", "sensor", "manual_data_verification", "2026_cycle",
+       "hydro_vu_pull", "flagged_data"),
+  pattern = "-DO\\.parquet$", full.names = TRUE
+) %>%
+  map(read_parquet) %>%
+  bind_rows()
+
+do_2026 <- raw_2026 %>%
+  transmute(
+    site, parameter, DT_round, mean, auto_flag, mal_flag,
+    user_qc_flag = NA_character_,
+    # no human verification yet, so fall back to the malfunction flag
+    user_burial  = str_detect(replace_na(mal_flag, ""), "burial")
+  )
+
+# 2026 also carries last_site_visit, which we use below to mark visits
+visits_2026 <- raw_2026 %>% distinct(site, visit_DT = last_site_visit)
+
+do_data <- bind_rows(do_hydro, do_2026) %>%
+  ross.wq.tools::fix_site_names() %>%
+  mutate(year = lubridate::year(DT_round)) %>%
+  arrange(site, DT_round)
+```
+
+Now prep the data: pull in the field notes for the visit timestamps, mark each
+site visit in the series, then split by year and by site so the methods can run
+over one site-year at a time.
+
+```{r prep-do}
+# field notes give visit times that were not always written into a flag column
+field_note_visits <- c("2023", "2024", "2025") %>%
+  map_dfr(~ read_csv(
+    here("data", "collated", "sensor", "hydroshare_pub", .x,
+         sprintf("CSU_ROSS_sensor_field_notes_%s.csv", .x)),
+    show_col_types = FALSE
+  ) %>% transmute(site, visit_DT = DateTime_UTC))
+
+visits <- bind_rows(field_note_visits, visits_2026) %>%
+  ross.wq.tools::fix_site_names() %>%
+  filter(!is.na(visit_DT)) %>%
+  distinct(site, visit_DT)
+
+# a row is a site visit if a flag column says so, or if it is the closest
+# observation to a field-note visit time. Mark only the first row of each run
+# so the visit split increments once per visit.
+do_prepped <- do_data %>%
+  group_by(site) %>%
+  group_modify(function(df, key) {
+    v <- visits$visit_DT[visits$site == key$site]
+    nearest <- map_int(v, function(t) {
+      d <- as.numeric(abs(difftime(df$DT_round, t, units = "mins")))
+      if (min(d) > 180) NA_integer_ else which.min(d)
+    })
+    df %>% mutate(
+      flag_txt   = paste(replace_na(auto_flag, ""), replace_na(user_qc_flag, "")),
+      hit        = str_detect(flag_txt, "site visit(?! window)") |
+                     row_number() %in% nearest,
+      flag       = if_else(hit & !lag(hit, default = FALSE),
+                           "site visit", NA_character_),
+      site_visit = !is.na(flag)
+    ) %>% select(-flag_txt, -hit)
+  }) %>%
+  ungroup()
+
+# do_split[["2024"]][["elc"]] -> one site-year DO frame
+do_split <- do_prepped %>%
+  filter(year %in% 2023:2026) %>%
+  split(f = .$year) %>%
+  map(~ split(.x, f = .x$site))
+```
+
+# Method comparison
+
+Here we compare the original method with an updated version of the method
+that Sam came up with. I have slightly tweaked the method to increase
+the function's false positive rate (reduce the amount of flags we put on 
+data that should not be flagged).
+
+## Original Method
+
+The original method is `find_do_noise()` in `ross.wq.tools`. It works in two
+steps. First it tags each point as "DO interference" if the point sits at
+least 0.5 mg/L below both of its neighbors (a spike), or if DO is at or below
+5 mg/L. Then it tags "Possible burial" wherever a 96-observation window (about
+24 hours) holds at least 24 interference points. That window check runs both
+right-aligned and center-aligned, and a point is flagged if either alignment
+trips.
+
+The window is counted in observations, not in time, and the series is never
+split at site visits. So a data gap shrinks the real time span the window
+covers, and a window can average across a cleaning event.
+
+```{r original-method}
+# Original method: find_do_noise() from ross.wq.tools, written out step by step
+# instead of called. Two steps, run per site-year so a window never crosses a
+# site or a year boundary:
+#   1. point-level "DO interference": the point sits >= 0.5 mg/L below both of
+#      its neighbors (a spike), or DO is at or below 5 mg/L.
+#   2. "Possible burial": a 96-observation (~24 h) window holds >= 24
+#      interference points, checked both right- and center-aligned.
+# No site-visit split. The window is counted in observations, not in time.
+# Every year is flagged the same way. 2023 is the year with the most confirmed
+# real burials; 2026 is the anomalous low-DO year from the motivation.
+
+DO_old <- do_split %>%
+  map(~ map(.x, function(df) {
+
+    df <- df %>%
+      arrange(DT_round) %>%
+      generate_summary_statistics()          # adds back1 / front1 (the neighbors)
+
+    df %>%
+      mutate(
+        # --- step 1: point-level interference -------------------------------
+        # downward spike: this point is >= 0.5 mg/L below the point before it
+        # and the point after it
+        old_spike = (back1 - mean >= 0.5) & (front1 - mean >= 0.5),
+        # unrealistic low: DO at or below 5 mg/L
+        old_low   = mean <= 5,
+        old_interference = replace_na(old_spike | old_low, FALSE),
+
+        # --- step 2: persistence over ~24 h --------------------------------
+        # count interference points in a rolling 96-observation window and flag
+        # the window if it holds at least 24. Run it right-aligned (window ends
+        # on the point) and center-aligned (point in the middle).
+        .bin = as.integer(old_interference),
+        .win_right  = data.table::frollapply(.bin, N = 96,
+                        FUN = function(x) sum(x) >= 24, align = "right",  fill = NA),
+        .win_center = data.table::frollapply(.bin, N = 96,
+                        FUN = function(x) sum(x) >= 24, align = "center", fill = NA),
+        old_burial = replace_na(.win_right == 1 | .win_center == 1, FALSE),
+
+        # combined flag text, same format the package writes
+        flag_old = case_when(
+          old_interference & old_burial ~ "DO interference;Possible burial",
+          old_burial                    ~ "Possible burial",
+          old_interference              ~ "DO interference",
+          TRUE                          ~ NA_character_
+        )
+      ) %>%
+      select(-.bin, -.win_right, -.win_center)
+  })) %>%
+  list_flatten() %>%
+  list_rbind()
+```
+
+## Updated Method
+
+The updated method is Sam's `find_do_noise_new()` with one tweak from me. It
+first splits the series at every site visit so no window ever averages across
+a cleaning. Within each split it computes three windows:
+
+- `low_right`: mean DO below 5 mg/L over the trailing 24 hours
+- `low_center`: mean DO below 5 mg/L over a centered +/- 12 hour window
+- `static_right`: DO range (max minus min) under 1 mg/L over the trailing 24
+  hours, meaning the diel cycle is gone. Needs at least 10 points in the
+  window.
+
+Sam's flag reduces to `low_right | low_center`.
+
+My tweak is on `low_center`. At the end of a split the centered window loses
+its forward half, so a point sitting in the normal overnight low can end up
+with a trailing-only window that averages below 5 mg/L. That flags the last
+few points before a site visit as burial when nothing is wrong. With the
+tweak, `low_center` can flag on its own only when its +/- 12 hour window
+actually holds data on both sides (at least 80% of the 720 minute half-span,
+before and after the point, measured in time). Otherwise it can only back up
+one of the other two signals. The flag becomes
+`low_right | (static_right & low_center) | (low_center & center_well_covered)`.
+
+```{r updated-method}
+# Updated method: Sam's find_do_noise_new() plus my low_center coverage gate,
+# written out step by step. Run per site-year, and within each, split the series
+# at every site visit so no window averages across a cleaning.
+#   low_right    : trailing 24 h mean DO < 5 mg/L
+#   low_center   : centered +/- 12 h mean DO < 5 mg/L
+#   static_right : trailing 24 h DO range < 1 mg/L (diel cycle gone), >= 10 pts
+#   center_well_covered : the +/- 12 h window holds >= 80% of its half-span of
+#     data on BOTH sides -- my gate on a lone low_center
+# Two burial columns are kept so the tweak's effect can be measured:
+#   new_burial_sam = low_right | low_center                       (Sam's)
+#   new_burial     = low_right | (static_right & low_center)
+#                    | (low_center & center_well_covered)         (with my tweak)
+
+too_low       <- function(x) mean(x, na.rm = TRUE) < 5
+no_diel_cycle <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 10) return(NA)          # not enough points to judge the range
+  (max(x) - min(x)) < 1.0
+}
+
+DO_new <- do_split %>%
+  map(~ map(.x, function(df) {
+
+    half_span_secs <- 720 * 60             # +/- 12 h, in seconds
+    min_cover      <- 0.8                  # 80% of each half-span, measured in time
+
+    df %>%
+      arrange(DT_round) %>%
+      generate_summary_statistics() %>%
+      # split at each site visit
+      mutate(visit_group = cumsum(str_detect(replace_na(flag, ""), "site visit"))) %>%
+      group_by(visit_group) %>%
+      mutate(
+        low_right    = slide_index_dbl(mean, DT_round, too_low,
+                         .before = minutes(1440)),
+        low_center   = slide_index_dbl(mean, DT_round, too_low,
+                         .before = minutes(720), .after = minutes(720)),
+        static_right = slide_index_dbl(mean, DT_round, no_diel_cycle,
+                         .before = minutes(1440)),
+        # time actually spanned by the centered window on each side of the point
+        span_before  = slide_index_dbl(as.numeric(DT_round), DT_round,
+                         ~ max(.x) - min(.x), .before = minutes(720)),
+        span_after   = slide_index_dbl(as.numeric(DT_round), DT_round,
+                         ~ max(.x) - min(.x), .after = minutes(720))
+      ) %>%
+      ungroup() %>%
+      mutate(
+        lr = replace_na(low_right    == 1, FALSE),
+        lc = replace_na(low_center   == 1, FALSE),
+        sr = replace_na(static_right == 1, FALSE),
+        center_well_covered = replace_na(
+          span_before >= min_cover * half_span_secs &
+          span_after  >= min_cover * half_span_secs, FALSE),
+
+        new_burial_sam = lr | lc,
+        new_burial     = lr | (sr & lc) | (lc & center_well_covered),
+        flag_new = if_else(new_burial, "Possible burial", NA_character_)
+      ) %>%
+      select(-lr, -lc, -sr)
+  })) %>%
+  list_flatten() %>%
+  list_rbind()
+```
+
+
+# Method Comparisons
+
+These two methods go after the same problem in very different ways. The point
+I want to make here is that there is no silver bullet. A burial event shows up
+in many different forms in the DO signal, and both methods try to capture that
+variability with heuristics built from physical rules. The solution space is
+huge. Even these two methods have many permutations I did not test, and many
+more tweaks could be added to make them "better". 
+
+The table below lays out the physical reasoning behind each rule and which
+method uses it.
+
+| Rule | Physical reasoning | Original | Updated |
+|------|--------------------|----------|---------|
+| Point sits well below both neighbors (spike) | DO cannot change that fast and bounce back; a lone drop is a sensor artifact, not water chemistry | yes | no |
+| DO below 5 mg/L | a buried sensor loses contact with moving, oxygenated water and reads too low | yes (per point) | yes (window mean) |
+| Low DO persists for ~24 h | a real burial lasts; transient noise does not | yes (count of interference points) | yes (window mean) |
+| Diel cycle is gone (flat signal) | burial removes the daily photosynthesis and respiration swing in DO | no | yes (`static_right`) |
+| Split the series at each site visit | a cleaning resets the sensor, so data on either side should not be pooled | no | yes |
+| Centered window, not just trailing | a centered window catches the onset of a burial about 12 h earlier | no | yes (`low_center`) |
+| Ignore a centered window missing half its data | a half-empty window near a visit or gap should not flag on its own | no | yes (my tweak) |
+| Windows measured in time, not observations | a data gap should not silently shrink the real time span the window covers | no | yes |
+
+```{r join-methods}
+# one row per site-timestamp, both methods side by side
+DO_both <- DO_old %>%
+  select(site, DT_round, year, mean, season, site_visit, user_burial,
+         old_interference, old_burial, flag_old) %>%
+  left_join(
+    DO_new %>% select(site, DT_round, visit_group, low_right, low_center,
+                      static_right, center_well_covered,
+                      new_burial_sam, new_burial, flag_new),
+    by = c("site", "DT_round")
+  ) %>%
+  # which subset of {original, updated} flagged each point
+  mutate(combo = factor(
+    case_when(
+      !old_burial & !new_burial ~ "neither",
+       old_burial & !new_burial ~ "original only",
+      !old_burial &  new_burial ~ "updated only",
+       old_burial &  new_burial ~ "both"
+    ),
+    levels = c("neither", "original only", "updated only", "both")
+  )) %>%
+  # is the point within 13 h of a site visit? (for the near-visit analysis)
+  group_by(site, year) %>%
+  mutate(near_visit = {
+    vt <- sort(as.numeric(DT_round[site_visit]))
+    if (length(vt) == 0) rep(FALSE, n()) else {
+      t <- as.numeric(DT_round); j <- findInterval(t, vt)
+      d_prev <- ifelse(j >= 1,        t - vt[pmax(j, 1)],              Inf)
+      d_next <- ifelse(j < length(vt), vt[pmin(j + 1, length(vt))] - t, Inf)
+      pmin(d_prev, d_next) < 13 * 3600
+    }
+  }) %>%
+  ungroup()
+```
+
+```{r plot-fn}
+# One interactive plot for a site-year: DO over time, points colored by which
+# method(s) flagged "Possible burial", red dashed lines at site visits, orange
+# shading over verified-burial stretches (user_qc_flag, or mal_flag for 2026).
+plot_burial <- function(site_name, yr, data = DO_both) {
+
+  d <- data %>% filter(site == site_name, year == yr) %>% arrange(DT_round)
+  if (nrow(d) == 0) stop("no data for ", site_name, " ", yr)
+
+  # verified-burial stretches -> plotly rectangles (contiguous runs, gap > 20 min
+  # starts a new one). ggplotly drops geom_rect(ymin = -Inf), so add them as
+  # native shapes with numeric (epoch-second) x coords.
+  gt <- d %>% filter(user_burial)
+  shapes <- if (nrow(gt) == 0) list() else {
+    gt %>%
+      mutate(run = cumsum(c(TRUE, diff(as.numeric(DT_round)) > 1200))) %>%
+      group_by(run) %>%
+      summarise(x0 = min(DT_round), x1 = max(DT_round), .groups = "drop") %>%
+      purrr::pmap(function(run, x0, x1) list(
+        type = "rect", xref = "x", yref = "paper",
+        x0 = as.numeric(x0), x1 = as.numeric(x1), y0 = 0, y1 = 1,
+        fillcolor = "orange", opacity = 0.15, line = list(width = 0)))
+  }
+
+  combo_cols <- c("neither" = "grey80", "original only" = "#e41a1c",
+                  "updated only" = "#377eb8", "both" = "#984ea3")
+
+  p <- ggplot(d, aes(DT_round, mean, color = combo,
+                     text = paste0(format(DT_round), "<br>DO: ", round(mean, 2),
+                                   "<br>", combo))) +
+    geom_point(size = 1) +
+    geom_vline(data = filter(d, site_visit), aes(xintercept = DT_round),
+               color = "red", linetype = "dashed", inherit.aes = FALSE) +
+    scale_color_manual(values = combo_cols, drop = FALSE) +
+    labs(title = paste(site_name, yr), x = NULL, y = "DO (mg/L)", color = NULL) +
+    theme_minimal()
+
+  gp <- plotly::ggplotly(p, tooltip = "text")
+  gp$x$layout$shapes <- shapes
+  gp
+}
+```
+
+```{r}
+plot_burial("elc", 2023)
+```
+
+# Newer Method
+
+Here I want to show a method I found while working on this problem. It is not
+something I plan to implement soon, but it is a strong approach and one we
+should consider going forward. It is the third method here, so
+`find_do_noise_v3()`.
+
+## The van Brakel z-score filter
+
+The base of the method is van Brakel's z-score filter. It keeps a running
+mean and standard deviation over a trailing window of points that have so far
+looked clean. A new point counts as a spike when it lands more than k standard
+deviations from that running mean, where k is a multiplier (we use 4). A point
+flagged as a spike does not update the running mean and standard deviation; it
+is held flat instead, so a spike cannot pull the band toward itself. A point
+above the band is a positive spike, below it a negative spike.
+
+## The Skalvik sequential filter
+
+Skalvik et al. (2024) use van Brakel's filter as one stage of a sequential
+filter. The stages run in order, and a point that fails an earlier stage is
+left out of the statistics every later stage is built from:
+
+1. Drop NA and NaN.
+2. High rate of change: reject a point when the step from the previous point
+   is larger than a physically plausible slope.
+3. van Brakel z-score band, run on the points that passed stages 1 and 2.
+
+Skalvik also has a static out-of-range stage and a rule that the filter should
+only start once the sensor is clean, deployed, and stable.
+
+## Our tweaks
+
+On top of the Skalvik pipeline:
+
+- **Time-indexed windows.** The running windows are measured in time, not in
+  observation counts, so a data gap does not silently shrink the window. Run
+  both right-aligned and centered.
+- **`sigma_nat`, a floor on the band width.** During a flat stretch the
+  standard deviation collapses toward zero and every small wiggle reads as a
+  spike. `sigma_nat` is the smallest the band half-width is allowed to be. It
+  is derived from the 12 hour rolling standard deviation of verified-good DO
+  and set by season (snowmelt 0.40, monsoon 0.50, fall baseflow 0.70, winter
+  baseflow 0.80 mg/L).
+- **`band_hw_max`, a cap on the band width.** Over a 24 hour window k times the
+  standard deviation tracks the diel swing and can push the band out to +/- 6
+  to 8 mg/L, which lets real spikes through. The half-width is capped at 2
+  mg/L, so the band is `min(max(k * sd, sigma_nat), 2)`. The lower edge is
+  also floored at 0, since a negative DO band means nothing.
+- **Count gate and burn-in.** Stage 3 only runs with enough valid points in
+  the window and only after 6 hours past the last reset.
+- **Site-visit reset.** The running mean and standard deviation, the filtered
+  series, and the burn-in clock all restart at each cleaning event.
+- **Drop the static out-of-range stage.** The only hard bound kept is DO below
+  5 mg/L, and it is not a flag on its own. It only matters together with a
+  negative spike.
+- **Persistence layer for burial.** Per-point signals are -1, 0, or +1.
+  "Possible burial" needs a sustained run of negative spikes that are also
+  below 5 mg/L over a 24 hour window (at least 75% of the evaluated points).
+
+An earlier draft also flagged a variance collapse, where the window standard
+deviation drops below a fraction of the seasonal value. Burial shows up as
+both low and high variance depending on the site, so that rule was dropped.
+The method is trying to do one thing: find a run of negative spikes at a
+depressed baseline.
+
+```{r v3-params}
+# sigma_nat: the smallest the spike band half-width is allowed to be (mg/L).
+# Derived from the 12 h rolling SD of verified-good DO, by season.
+do_sigma_nat <- c(snowmelt = 0.40, monsoon = 0.50,
+                  fall_baseflow = 0.70, winter_baseflow = 0.80)
+do_sigma_nat_fixed <- 0.5   # fallback when a season is missing
+
+do_v3_defaults <- list(
+  k                = 3,     # SD multiplier for the band
+  sigma_nat        = do_sigma_nat,
+  window_hr        = 12,    # trailing window for the running mean / SD
+  burn_in_hr       = 6,     # no spike verdict until this long past a reset
+  min_frac_valid   = 0.5,   # window must be at least this fraction valid points
+  slope_step_mult  = 15,    # t_slope_behind_* is mg/L/min -> * 15 for a 15-min step
+  y_diff_max       = 1.0,   # stage-2 fallback if the slope threshold is missing
+  influence        = 0,     # van Brakel w; 0 = spikes fully excluded from stats
+  band_hw_max      = 2,     # hard cap on the band half-width (mg/L)
+  low_do_cut       = 5,     # a negative spike only counts toward burial below this
+  burial_window_hr = 24,    # persistence window for "Possible burial"
+  burial_min_frac  = 0.75   # this fraction of the window low + negative -> burial
+)
+
+#' V3 DO noise / burial detector (Skalvik pipeline).
+#' @param df  one site DO frame: DT_round, mean, season, flag, parameter
+#' @param seasonal_thresholds  site x season table with t_slope_behind_01/99
+#'   (t_mean01/99 are read but not used by the detector itself)
+find_do_noise_v3 <- function(df, seasonal_thresholds, pars = do_v3_defaults) {
+
+  if (!("DO" %in% df$parameter)) return(df)
+  visit_regex <- "(site\\s*visit|\\bsv\\b)"
+  site_i <- df$site[1]
+
+  # tolerate a minimal / partial thresholds table: a missing site or missing
+  # t_slope_behind_* columns degrade stage 2 to the y_diff_max fallback.
+  st <- seasonal_thresholds
+  if ("parameter" %in% names(st)) st <- dplyr::filter(st, parameter == "DO")
+  st <- st %>%
+    dplyr::filter(site == site_i) %>%
+    dplyr::distinct(season, .keep_all = TRUE) %>%
+    dplyr::select(dplyr::any_of(c("season", "t_mean01", "t_mean99",
+                                  "t_slope_behind_01", "t_slope_behind_99")))
+  for (col in c("t_mean01", "t_mean99",
+                "t_slope_behind_01", "t_slope_behind_99")) {
+    if (!col %in% names(st)) st[[col]] <- NA_real_
+  }
+
+  df <- df %>%
+    dplyr::select(-dplyr::any_of(c("t_mean01", "t_mean99", "t_sd_0199",
+                                   "t_slope_behind_01", "t_slope_behind_99"))) %>%
+    dplyr::arrange(DT_round) %>%
+    dplyr::mutate(visit_group = cumsum(stringr::str_detect(
+      tidyr::replace_na(flag, ""),
+      stringr::regex(visit_regex, ignore_case = TRUE)))) %>%
+    dplyr::left_join(st, by = "season")
+
+  n   <- nrow(df)
+  y   <- df$mean
+  tt  <- as.numeric(df$DT_round)                 # epoch seconds
+  grp <- df$visit_group
+
+  # per-row sigma_nat (by season, or a scalar)
+  sig_nat <- if (is.null(names(pars$sigma_nat))) {
+    rep(as.numeric(pars$sigma_nat[1]), n)
+  } else {
+    v <- unname(pars$sigma_nat[df$season]); v[is.na(v)] <- do_sigma_nat_fixed; v
+  }
+
+  # ---- stage 1: NA ----
+  na_bad <- is.na(y)
+
+  # ---- stages 2 & 3: sequential, reset per visit group ----
+  rate_bad  <- logical(n)
+  signal    <- integer(n)                        # -1 / 0 / +1
+  avg_f     <- rep(NA_real_, n)
+  sd_win    <- rep(NA_real_, n)
+  band_hw   <- rep(NA_real_, n)
+  filt      <- rep(NA_real_, n)                  # filteredY: survivors only
+  evaluated <- logical(n)
+
+  win_sec  <- pars$window_hr * 3600
+  burn_sec <- pars$burn_in_hr * 3600
+  exp_pts  <- pars$window_hr * 4                 # 15-min cadence
+
+  for (g in unique(grp)) {
+    idx  <- which(grp == g)
+    seg0 <- tt[idx[1]]
+    prev <- NA_integer_                          # previous point past stage 1
+    last_filt <- NA_real_
+    for (i in idx) {
+
+      if (na_bad[i]) next                        # do NOT advance prev past a reject
+
+      # stage 2: high rate vs the previous survivor, if adjacent in time
+      if (!is.na(prev) && (tt[i] - tt[prev]) <= 2 * 900) {
+        ymax <- suppressWarnings(max(abs(df$t_slope_behind_01[i]),
+                                     df$t_slope_behind_99[i], na.rm = TRUE)) *
+          pars$slope_step_mult
+        if (!is.finite(ymax)) {
+          ymax <- if (is.null(pars$y_diff_max)) Inf else pars$y_diff_max
+        }
+        if (is.finite(ymax) && abs(y[i] - y[prev]) > ymax) rate_bad[i] <- TRUE
+      }
+      if (rate_bad[i]) { prev <- i; next }
+
+      # stage 3: spike vs running stats of filteredY in the trailing window
+      w <- which(!is.na(filt) & tt >= tt[i] - win_sec & tt < tt[i])
+      if (length(w) >= max(3, pars$min_frac_valid * exp_pts) &&
+          (tt[i] - seg0) >= burn_sec) {
+        mu <- mean(filt[w]); s <- stats::sd(filt[w])
+        half <- max(pars$k * s, sig_nat[i])
+        if (!is.null(pars$band_hw_max)) half <- min(half, pars$band_hw_max)
+        avg_f[i] <- mu; sd_win[i] <- s; band_hw[i] <- half; evaluated[i] <- TRUE
+        if      (y[i] > mu + half)         signal[i] <-  1L
+        else if (y[i] < max(mu - half, 0)) signal[i] <- -1L  # band floor >= 0
+      }
+
+      # update filteredY (influence 0 -> a spike is carried flat, not chased)
+      if (signal[i] != 0 && !is.na(last_filt)) {
+        filt[i] <- pars$influence * y[i] + (1 - pars$influence) * last_filt
+      } else {
+        filt[i] <- y[i]
+      }
+      last_filt <- filt[i]
+      prev <- i
+    }
+  }
+
+  # ---- burial layer: sustained run of low negative spikes, reset per group ----
+  low_cut   <- if (is.null(pars$low_do_cut)) 5 else pars$low_do_cut
+  below_cut <- !is.na(y) & y < low_cut
+  neg_ind   <- ifelse(evaluated & signal == -1 & below_cut, 1,
+               ifelse(evaluated, 0, NA_real_))
+
+  df %>%
+    dplyr::mutate(
+      .signal = signal, .evaluated = evaluated, .rate_bad = rate_bad,
+      .avg_f = avg_f, .sd_win = sd_win, .band_hw = band_hw,
+      .band_lo = pmax(avg_f - band_hw, 0), .band_hi = avg_f + band_hw,
+      .neg_ind = neg_ind
+    ) %>%
+    dplyr::group_by(visit_group) %>%
+    dplyr::mutate(
+      .neg_frac = slider::slide_index_dbl(
+        .neg_ind, DT_round, ~ mean(.x, na.rm = TRUE),
+        .before = lubridate::hours(pars$burial_window_hr))
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      spike_flag_v3 = dplyr::case_when(.signal ==  1 ~ "positive spike",
+                                       .signal == -1 ~ "negative spike",
+                                       TRUE ~ NA_character_),
+      .burial_persist = dplyr::coalesce(.neg_frac >= pars$burial_min_frac, FALSE),
+      flag_v3 = dplyr::case_when(
+        .burial_persist ~ "Possible burial",
+        .signal != 0    ~ spike_flag_v3,
+        .rate_bad       ~ "high rate",
+        TRUE ~ NA_character_)
+    )
+}
+```
+
+The stage-2 slope threshold comes from the seasonal-threshold archive. The
+newest file is a 2026 one; we reuse it for the older years too (the sites are
+stable, and a missing site just falls back to the 1 mg/L per step default).
+
+```{r v3-run, cache = TRUE}
+seasonal_thresholds <- read_parquet(here(
+  "data", "derived", "auto_qaqc_files", "thresholds",
+  "seasonal_thresholds20260304-T175010Z.parquet")) %>%
+  filter(parameter == "DO") %>%
+  distinct(site, season, .keep_all = TRUE)
+
+# roughly 5 s per site-year, so this chunk is cached
+DO_v3 <- do_split %>%
+  map(~ map(.x, ~ generate_summary_statistics(.x) %>%
+                  find_do_noise_v3(seasonal_thresholds))) %>%
+  list_flatten() %>%
+  list_rbind()
+```
+
+## 3-Way Method Comparison
+
+```{r join-3way}
+DO_three <- DO_both %>%
+  left_join(
+    DO_v3 %>% select(site, DT_round, flag_v3,
+                     v3_burial  = .burial_persist,
+                     v3_signal  = .signal,
+                     v3_band_lo = .band_lo,
+                     v3_band_hi = .band_hi),
+    by = c("site", "DT_round")
+  ) %>%
+  mutate(
+    m_old = old_burial,
+    m_new = new_burial,
+    m_v3  = coalesce(v3_burial, FALSE),
+    # v3's non-burial output. Only a negative spike counts as a "v3 tag";
+    # positive spikes and high-rate flags are ignored (-> "none" / grey).
+    v3_tag = coalesce(flag_v3 == "negative spike", FALSE),
+    # combo3: which methods flagged the point. v3 contributes one of three
+    # states -- burial ("v3"), a tag ("v3 tag"), or nothing -- and a v3 tag
+    # shows even when original or updated also flagged a burial there.
+    .code = paste0(
+      if_else(m_old, "O", ""), if_else(m_new, "U", ""),
+      case_when(m_v3 ~ "B", v3_tag ~ "T", TRUE ~ "")
+    ),
+    .code = if_else(.code == "", "none", .code),
+    combo3 = factor(
+      recode(.code,
+        "T"   = "v3 tag",
+        "O"   = "original",       "U"   = "updated",
+        "OU"  = "original+updated",
+        "OT"  = "original+v3 tag", "UT"  = "updated+v3 tag",
+        "OUT" = "original+updated+v3 tag",
+        "B"   = "v3",
+        "OB"  = "original+v3",     "UB"  = "updated+v3",
+        "OUB" = "all three"),
+      levels = c("none", "v3 tag",
+                 "original", "updated", "original+updated",
+                 "original+v3 tag", "updated+v3 tag", "original+updated+v3 tag",
+                 "v3", "original+v3", "updated+v3", "all three")
+    )
+  ) %>%
+  select(-.code)
+```
+
+Every confirmed-burial event in the data: contiguous runs of `user_burial`,
+merged across gaps shorter than 24 h. `hit_*` is the fraction of the event's
+points that method flagged "Possible burial" -- a rough per-event recall. Use
+`plot_burial_3way(site, year)` to look at any of them.
+
+```{r burial-events}
+burial_events <- DO_three %>%
+  filter(user_burial) %>%
+  arrange(site, DT_round) %>%
+  group_by(site) %>%
+  mutate(event = cumsum(c(TRUE, diff(as.numeric(DT_round)) > 24 * 3600))) %>%
+  group_by(site, event) %>%
+  summarise(
+    year  = min(year),
+    start = min(DT_round),
+    end   = max(DT_round),
+    days  = round(as.numeric(difftime(max(DT_round), min(DT_round),
+                                      units = "days")), 1),
+    n_pts = n(),
+    hit_original = round(mean(old_burial), 2),
+    hit_updated  = round(mean(new_burial), 2),
+    hit_v3       = round(mean(m_v3), 2),
+    .groups = "drop"
+  ) %>%
+  select(site, year, start, end, days, n_pts,
+         hit_original, hit_updated, hit_v3) %>%
+  arrange(site, start)
+
+burial_events
+```
+
+```{r plot-fn-3way}
+# Same idea as plot_burial() but for all three methods. Points are colored by
+# which methods flagged the point (combo3). A "v3 tag" (v3 negative spike)
+# shows even when original or updated also called a burial there; the "+v3 tag"
+# colors are the lighter shades. The grey lines are v3's stage-3
+# band (rolling mean +/- half-width) -- what v3 compares each point against.
+plot_burial_3way <- function(site_name, yr, data = DO_three) {
+
+  d <- data %>% filter(site == site_name, year == yr) %>% arrange(DT_round)
+  if (nrow(d) == 0) stop("no data for ", site_name, " ", yr)
+
+  gt <- d %>% filter(user_burial)
+  shapes <- if (nrow(gt) == 0) list() else {
+    gt %>%
+      mutate(run = cumsum(c(TRUE, diff(as.numeric(DT_round)) > 1200))) %>%
+      group_by(run) %>%
+      summarise(x0 = min(DT_round), x1 = max(DT_round), .groups = "drop") %>%
+      purrr::pmap(function(run, x0, x1) list(
+        type = "rect", xref = "x", yref = "paper",
+        x0 = as.numeric(x0), x1 = as.numeric(x1), y0 = 0, y1 = 1,
+        fillcolor = "orange", opacity = 0.15, line = list(width = 0)))
+  }
+
+  combo_cols <- c(
+    "none"                     = "grey85",
+    "v3 tag"                   = "#e6ab02",   # gold
+    "original"                 = "#e41a1c",
+    "updated"                  = "#377eb8",
+    "original+updated"         = "#984ea3",
+    "original+v3 tag"          = "#fb9a99",   # light red
+    "updated+v3 tag"           = "#a6cee3",   # light blue
+    "original+updated+v3 tag"  = "#cab2d6",   # light purple
+    "v3"                       = "#4daf4a",
+    "original+v3"              = "#ff7f00",
+    "updated+v3"               = "#00ced1",
+    "all three"                = "#f781bf"
+  )
+
+  band <- d %>%
+    filter(!is.na(v3_band_lo)) %>%
+    select(DT_round, visit_group, v3_band_lo, v3_band_hi) %>%
+    pivot_longer(c(v3_band_lo, v3_band_hi), values_to = "y")
+
+  p <- ggplot(d, aes(DT_round, mean)) + 
+    geom_line(data = band,
+              aes(DT_round, y, group = interaction(visit_group, name)),
+              color = "grey70", linewidth = 0.3, inherit.aes = FALSE) +
+    geom_point(aes(color = combo3,
+                   text = paste0(format(DT_round), "<br>DO: ", round(mean, 2),
+                                 "<br>", combo3)), size = 1) +
+    geom_vline(data = filter(d, site_visit), aes(xintercept = DT_round),
+               color = "red", linetype = "dashed", inherit.aes = FALSE) +
+    scale_color_manual(values = combo_cols, drop = FALSE) +
+    labs(title = paste(site_name, yr, "-- 3-way"),
+         x = NULL, y = "DO (mg/L)", color = NULL) +
+    theme_minimal()
+
+  gp <- plotly::ggplotly(p, tooltip = "text")
+  gp$x$layout$shapes <- shapes
+  gp
+}
+```
+
+```{r}
+plot_burial_3way("bellvue", 2023)
+```
+
+```{r}
+plot_burial_3way("archery", 2026)
+```
+
+## Confusion matrix
+
+Point-level, against `user_burial` (technician-verified burial). A point is a
+positive if the method flagged "Possible burial" there. 2026 is left out
+because it has not been through manual verification yet, so there is no real
+ground truth for it. `user_burial` is still imperfect in both directions for
+2023-2025, so read these as rough. Burial is a small fraction of points, so
+accuracy is not useful -- precision, recall, and specificity are.
+
+```{r confusion-plot, fig.width = 9, fig.height = 3.6}
+# 2x2 cell counts for one prediction vs user_burial
+confusion_cells <- function(pred, actual) {
+  pred   <- coalesce(pred, FALSE)
+  actual <- coalesce(actual, FALSE)
+  tibble(
+    truth = if_else(actual, "burial", "no burial"),
+    pred  = if_else(pred,   "flagged", "not flagged")
+  ) %>% count(truth, pred, name = "n")
+}
+
+# 2023-2025 only -- 2026 is not verified
+cm_data <- DO_three %>% filter(year <= 2025)
+
+cm <- bind_rows(
+  original = confusion_cells(cm_data$old_burial, cm_data$user_burial),
+  updated  = confusion_cells(cm_data$new_burial, cm_data$user_burial),
+  v3       = confusion_cells(cm_data$m_v3,        cm_data$user_burial),
+  .id = "method"
+) %>%
+  mutate(
+    truth = factor(truth, levels = c("burial", "no burial")),
+    pred  = factor(pred,  levels = c("not flagged", "flagged")),
+    cell  = case_when(
+      truth == "burial"    & pred == "flagged"     ~ "TP",
+      truth == "no burial" & pred == "flagged"     ~ "FP",
+      truth == "burial"    & pred == "not flagged" ~ "FN",
+      TRUE                                         ~ "TN"
+    )
+  )
+
+# precision / recall per method, for the facet strip labels
+cm_lab <- cm %>%
+  group_by(method) %>%
+  summarise(
+    precision = sum(n[cell == "TP"]) / sum(n[cell %in% c("TP", "FP")]),
+    recall    = sum(n[cell == "TP"]) / sum(n[cell %in% c("TP", "FN")]),
+    .groups = "drop"
+  ) %>%
+  mutate(strip = sprintf("%s\nprecision %.2f   recall %.2f",
+                         method, precision, recall))
+
+cm <- cm %>%
+  left_join(cm_lab, by = "method") %>%
+  mutate(strip = factor(strip, levels = cm_lab$strip[
+    order(match(cm_lab$method, c("original", "updated", "v3")))]))
+
+ggplot(cm, aes(pred, truth, fill = cell)) +
+  geom_tile(color = "white", linewidth = 1.5) +
+  geom_text(aes(label = paste0(cell, "\n", scales::comma(n))),
+            size = 3.3, lineheight = 0.95) +
+  facet_wrap(~ strip) +
+  scale_fill_manual(values = c(TP = "#a1d99b", FP = "#fc9272",
+                               FN = "#fdbe85", TN = "grey90"),
+                    guide = "none") +
+  labs(x = "prediction", y = "truth (user_burial)",
+       title = "Confusion matrix by method, point-level, 2023-2025") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+# Next Steps
+
+- Immediate next steps would probably be to combine both the old and new methods
+into one stronger method with more logic gates. Then add that back to ross.wq.tools.
