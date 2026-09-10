@@ -122,6 +122,32 @@ server <- function(input, output, session) {
     drift_windows(windows)
   })
 
+  # Click-to-Set Control Panel ----
+  # Lives in its own output so it can be placed independently in the UI
+  # (top-right, beside the plot) instead of inline with the window blocks.
+  # Regenerated whenever the window set changes so choices stay in sync
+  # with window_id.
+  output$click_target_controls <- renderUI({
+    windows <- drift_windows()
+    if (is.null(windows) || nrow(windows) == 0) return(NULL)
+
+    tagList(
+      selectInput(
+        "click_target_window", "Target window:",
+        choices  = windows$window_id,
+        selected = isolate(input$click_target_window) %||% windows$window_id[1]
+      ),
+      radioButtons(
+        "click_target_field", "Field to set on next click:",
+        choices  = c("Start" = "start_dt", "End" = "end_dt"),
+        selected = isolate(input$click_target_field) %||% "start_dt",
+        inline   = TRUE
+      ),
+      checkboxInput("auto_advance_field", "Auto-advance Start \u2192 End after click", value = TRUE),
+      helpText("Click anywhere on the plot to fill in the selected field for the target window. The matching timestamp textbox below will update automatically.")
+    )
+  })
+
   # Dynamic UI Control Generation ----
   output$dynamic_controls <- renderUI({
     windows <- drift_windows()
@@ -141,6 +167,47 @@ server <- function(input, output, session) {
         )
       })
     do.call(tagList, ui_elements)
+  })
+
+  # Click-to-Set Handler ----
+  # Listens for clicks on the driftPlot and writes the clicked timestamp into
+  # whichever start_dt_*/end_dt_* textInput is currently targeted, using the
+  # same update path a manual edit would use (so apply_windows works unchanged).
+  observeEvent(event_data("plotly_click", source = "driftPlot"), {
+    click <- event_data("plotly_click", source = "driftPlot")
+    req(click, input$click_target_window, input$click_target_field)
+
+    raw_x <- click$x
+    #Interpret click in to DT
+    clicked_dt <- suppressWarnings(lubridate::ymd_hm(raw_x, tz = "MST", quiet = TRUE))
+    if (is.na(clicked_dt)) {
+      num_x <- suppressWarnings(as.numeric(raw_x))
+      if (!is.na(num_x)) {
+        clicked_dt <- as.POSIXct(num_x / 1000, origin = "1970-01-01", tz = "MST")
+      }
+    }
+
+    if (is.na(clicked_dt)) {
+      showNotification("Could not parse the clicked timestamp - please try again.", type = "error")
+      return()
+    }
+
+    target_window <- input$click_target_window
+    field         <- input$click_target_field
+    target_input  <- paste0(field, "_", target_window)
+
+    updateTextInput(session, target_input, value = format(clicked_dt, "%Y-%m-%d %H:%M:%S"))
+
+    field_label <- if (field == "start_dt") "Start" else "End"
+    showNotification(
+      paste0("Window ", target_window, " ", field_label, " set to ", format(clicked_dt, "%Y-%m-%d %H:%M:%S")),
+      type = "message", duration = 3
+    )
+
+    # Optionally hop from Start to End so a Start/End pair only needs two clicks
+    if (isTRUE(input$auto_advance_field) && field == "start_dt") {
+      updateRadioButtons(session, "click_target_field", selected = "end_dt")
+    }
   })
 
   # Apply Window Parameter Updates ----
@@ -164,6 +231,10 @@ server <- function(input, output, session) {
 
       if (is.na(parsed_start) || is.na(parsed_end)) {
         showNotification(paste("Invalid date format in Block", i, "- skipping update."), type = "error")
+        next
+      }
+      if (parsed_start >= parsed_end) {
+        showNotification(paste("Start Date greater than End Date in Block", i, "- skipping update."), type = "error")
         next
       }
 
@@ -244,7 +315,7 @@ server <- function(input, output, session) {
     windows <- drift_windows()
 
     # Start the plot object
-    p <- plot_ly()
+    p <- plot_ly(source = "driftPlot")
 
     #  BASE LAYER
     p <- p %>% add_trace(
@@ -366,14 +437,16 @@ server <- function(input, output, session) {
     }
 
     # Final Plotly layout configurations
-    p %>% layout(
-      xaxis = list(
-        type = 'date',
-        title = "Date-Time (MST)",
-        hoverformat = "%Y-%m-%d %H:%M:%S"
-      ),
-      yaxis = list(title = "Value")
-    )
+    p %>%
+      layout(
+        xaxis = list(
+          type = 'date',
+          title = "Date-Time (MST)",
+          hoverformat = "%Y-%m-%d %H:%M:%S"
+        ),
+        yaxis = list(title = "Value")
+      ) %>%
+      event_register("plotly_click")
   })
 
   # Final Corrections Submission Processing ----

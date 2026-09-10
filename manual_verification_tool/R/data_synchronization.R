@@ -1,12 +1,13 @@
-sync_file_system <- function() {
+sync_file_system <- function(){
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
+
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
   # Duplicate file checks
   # Check if there are files that have duplicates, if there are any, run the file duplicate fixer
@@ -64,22 +65,27 @@ sync_file_system <- function() {
 # check pre verification directory (this is redundant, just double checking)
 check_pre_ver_dir <- function(pre_file_name) {
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
    tryCatch({
-    if (length(int_dir_names) > 0 & pre_file_name %in% int_dir_names) {
+    file_info <- split_filename(pre_file_name)
+    
+    # Check if a file with same site/parameter exists in int or ver directory
+    int_files <- int_dir_names[grepl(paste0("^", file_info$site, "-", file_info$parameter), int_dir_names)]
+    ver_files <- ver_dir_names[grepl(paste0("^", file_info$site, "-", file_info$parameter), ver_dir_names)]
+    
+    if (length(int_files) > 0) {
       file.remove(here(pre_dir_path, pre_file_name))
-      cat("removed file ", i, " from ", int_dir_path, "\n")
-    }
-    if (length(ver_dir_names) > 0 & pre_file_name %in% ver_dir_names) {
+      cat("removed file ", pre_file_name, " from ", pre_dir_path, " because it exists in intermediary\n")
+    } else if (length(ver_files) > 0) {
       file.remove(here(pre_dir_path, pre_file_name))
-      cat("removed file ", pre_file_name, " from ", ver_dir_path, "\n")
+      cat("removed file ", pre_file_name, " from ", pre_dir_path, " because it exists in verified\n")
     }
   }, error = function(e) {
     warning(sprintf("Error processing file %s: %s", pre_file_name, e$message))
@@ -89,15 +95,26 @@ check_pre_ver_dir <- function(pre_file_name) {
 # Check intermediary verification directory
 check_int_ver_dir <- function(int_file_name) {
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
   tryCatch({
+    #first check if the file is in the verified directory, if it is, remove it from the intermediary directory
+    file_info <- split_filename(int_file_name)
+    # Check for existing files with same site/parameter in verified dir
+    ver_files <- list.files(ver_dir_path, pattern = "\\.parquet$")
+    existing_files <- ver_files[grepl(paste0("^", file_info$site, "-", file_info$parameter), ver_files)]
+
+    if (length(existing_files) > 0){
+      file.remove(here(int_dir_path, int_file_name))
+      cat("Removed ", int_file_name, " from ", int_dir_path, " because it already exists in verified directory\n")
+    }
+
     # Only read in the verification columns
     df <- read_parquet(here(int_dir_path, int_file_name)) %>%
       select(verification_status, is_verified, is_finalized)
@@ -106,10 +123,10 @@ check_int_ver_dir <- function(int_file_name) {
     if (!any(df$verification_status == 'SKIP') & all(df$is_verified) & all(df$is_finalized)) {
       # Parse filename to get site and parameter
       file_info <- split_filename(int_file_name)
-
       # Check for existing files with same site/parameter in verified dir
-      ver_files <- list.files(ver_dir_path)
+      ver_files <- list.files(ver_dir_path, pattern = "\\.parquet$")
       existing_files <- ver_files[grepl(paste0("^", file_info$site, "-", file_info$parameter), ver_files)]
+
 
       # If existing files found, compare timestamps
       if (length(existing_files) > 0) {
@@ -144,13 +161,13 @@ check_int_ver_dir <- function(int_file_name) {
 # Check final verified directory
 check_fin_ver_dir <- function(ver_file_name) {
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
   tryCatch({
     # Only read verification columns
@@ -238,8 +255,8 @@ fix_duplicate_files <- function(dataframe_with_duplicate_info, directory){
 
            # and rename the file ...
            dt_string <- format(file$datetime, "%Y%m%d_%H%M%S")
-           new_file_name <- paste(file$site, file$parameter,
-                                  dt_string, file$hash, sep="_")
+           new_file_name <- paste0(file$site, "-", file$parameter,
+                                  "_", dt_string, "_", file$hash, ".parquet")
 
            file.rename(here(file$full_file_path), here(dirname(file$full_file_path), new_file_name))
 
@@ -270,13 +287,13 @@ fix_duplicate_files <- function(dataframe_with_duplicate_info, directory){
 # use a pre file and has made a weekly decision.
 move_file_to_intermediary_directory <- function(pre_to_int_filename, pre_to_int_df) {
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
 
   # Run initial sync to resolve pre-existing duplicates
@@ -331,13 +348,13 @@ move_file_to_intermediary_directory <- function(pre_to_int_filename, pre_to_int_
 # the file should be an parquet
 update_intermediary_data <- function(int_df_filename, updated_df) {
 
-   pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+   pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
   # Get current file metadata
   file_meta <- split_filename(int_df_filename)
@@ -380,13 +397,13 @@ update_intermediary_data <- function(int_df_filename, updated_df) {
 # on an int file.
 move_file_to_verified_directory <- function(int_to_fin_filename, int_to_fin_df) {
 
-  pre_dir_path <- here("manual_verification_tool",  "data", "pre_verification_directory")# pre_verification_path
-  int_dir_path <- here("manual_verification_tool",  "data", "intermediary_directory")# intermediary_path
-  ver_dir_path <- here("manual_verification_tool",  "data", "verified_directory")# verified_path
+  pre_dir_path <- pre_verification_path # pre_verification_path
+  int_dir_path <- intermediary_path # intermediary_path
+  ver_dir_path <- verified_path # verified_path
 
-  pre_dir_names <- list.files(pre_dir_path)
-  int_dir_names <- list.files(int_dir_path)
-  ver_dir_names <- list.files(ver_dir_path)
+  pre_dir_names <- list.files(pre_dir_path, pattern = "\\.parquet$")
+  int_dir_names <- list.files(int_dir_path, pattern = "\\.parquet$")
+  ver_dir_names <- list.files(ver_dir_path, pattern = "\\.parquet$")
 
   # Pre-move validation
   if(any(int_to_fin_df$verification_status == 'SKIP') ||
@@ -408,9 +425,10 @@ move_file_to_verified_directory <- function(int_to_fin_filename, int_to_fin_df) 
       # Use sync conflict resolution
       duplicate_info <- split_filename(ver_files) %>%
         bind_rows() %>%
-        mutate(full_file_path = file.path(ver_dir_path, filename))
+        mutate(full_file_path = file.path(ver_dir_path, filename))%>%
+        mutate(duplicate_alert = TRUE)
 
-      fix_duplicate_files(duplicate_info, "ver")
+      fix_duplicate_files(dataframe_with_duplicate_info = duplicate_info, directory = "ver")
     }
 
     # Move and validate

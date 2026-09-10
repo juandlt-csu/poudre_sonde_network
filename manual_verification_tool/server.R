@@ -69,16 +69,12 @@ server <- function(input, output, session) {
   # Check if data folder exists and if data/all_data subfolder has files, if files are available, show table of available files and allow user selection
   output$conditional_data_ui <- renderUI({
     # Check if data folder exists and if data/all_data subfolder has files
-    data_folder_exists <- dir.exists(here("manual_verification_tool",  "data"))
-    all_data_path <- here("manual_verification_tool",  "data", "all_data_directory")
+    data_folder_exists <- dir.exists(in_progress_path)
+    all_data_subfolder_exists <- dir.exists(all_data_path)
     all_data_subfolder_empty <- FALSE
-
-    if(data_folder_exists) {
-      all_data_subfolder_exists <- dir.exists(all_data_path)
       if(!all_data_subfolder_exists | length(list.files(all_data_path)) == 0) {
         all_data_subfolder_empty <- TRUE
       }
-    }
 
     if(!data_folder_exists|all_data_subfolder_empty){
       # Show file upload and timezone input if conditions are met
@@ -362,6 +358,8 @@ server <- function(input, output, session) {
   ## Week navigation handlers
   observeEvent(input$prev_week, {
     req(selected_data())
+    session$resetBrush("plot_brush")
+    brushed_areas(list())
     weeks <- unique(selected_data()$week)
     current <- current_week()
     idx <- which(weeks == current)
@@ -372,6 +370,8 @@ server <- function(input, output, session) {
   # Go to next week
   observeEvent(input$next_week, {
     req(selected_data())
+    session$resetBrush("plot_brush")
+    brushed_areas(list())
     weeks <- unique(selected_data()$week)
     current <- current_week()
     idx <- which(weeks == current)
@@ -385,6 +385,63 @@ server <- function(input, output, session) {
       current <- current_week()
       idx <- which(weeks == current)
     }
+  })
+
+  # Reactive to hold USGS flow data
+  usgs_flow_data <- reactive({
+    req(input$site, current_week(), isolate(selected_data()))
+
+    week_data <- isolate(selected_data()) %>% filter(week == current_week())
+    week_min_day <- min(week_data$DT_round, na.rm = TRUE)
+    week_max_day <- max(week_data$DT_round, na.rm = TRUE)
+
+    all_flow_sites <- input$site
+    flow_data_list <- purrr::map(all_flow_sites, function(site_name) {
+      abbrev_vals <- if (site_name %in% c("pbd", "bellvue", "pman", "pbr", "pfal", "cbri", "joei")) {
+        "CLAFTCCO"
+      } else if (site_name %in% c("salyer", "udall", "riverbend", "riverbend_virridy")) {
+        "CLAFORCO"
+      } else if (site_name %in% c("cottonwood", "cottonwood_virridy", "elc", "archery", "archery_virridy", "boxcreek", "springcreek", "riverbluffs")) {
+        "CLABOXCO"
+      } else if (site_name %in% c("sfm")) {
+        c("CLASRKCO", "CLAFTCCO")
+      } else if (site_name %in% c("chd")) {
+        c("JWCCHACO", "CLAFTCCO")
+      } else {
+        NA_character_
+      }
+      
+      if (all(is.na(abbrev_vals))) return(NULL)
+
+      tryCatch({
+        s_date <- week_min_day - days(2)
+        e_date <- week_max_day + days(2)
+
+        if (!is.null(global_usgs_flow_data) && nrow(global_usgs_flow_data) > 0) {
+          # Use pre-fetched global data
+          
+          # Safely determine the column name (station_abbrev or abbrev)
+          col_name <- if("station_abbrev" %in% names(global_usgs_flow_data)) "station_abbrev" else "abbrev"
+          
+          for (abbrev_val in abbrev_vals) {
+            data <- global_usgs_flow_data %>%
+              filter(!!sym(col_name) == abbrev_val,
+                     datetime >= s_date,
+                     datetime <= e_date)
+                     
+            if (nrow(data) > 0) {
+              data$site <- site_name
+              data$abbrev <- abbrev_val
+              return(data)
+            }
+          }
+        }
+        
+        return(NULL)
+      }, error = function(e) NULL)
+    }) %>% purrr::compact()
+
+    if (length(flow_data_list) > 0) bind_rows(flow_data_list) else NULL
   })
 
   ## Main plot (main plot starts here)
@@ -505,7 +562,7 @@ server <- function(input, output, session) {
             input$weekly_decision != "aa" & brush_omit ~ "OMIT"))
 
       #Remove omitted data (user or from weekly decision)
-      if (input$remove_omit) {
+      if (("remove_omit" %in% input$plot_options)) {
         week_choice_data <- week_choice_data %>%
           filter(final_decision != "OMIT")
 
@@ -513,7 +570,7 @@ server <- function(input, output, session) {
           filter(!brush_omit)
       }
       #Remove flagged data if user desired
-      if(input$remove_flag){
+      if(("remove_flag" %in% input$plot_options)){
         week_choice_data <- week_choice_data %>%
           filter(final_decision != "FLAGGED")
 
@@ -579,8 +636,12 @@ server <- function(input, output, session) {
         }) + #plot other sites
         geom_point(aes(y = mean, fill = final_decision),shape = 21, stroke = 0, size = 2) #plot main site with colors matching final decision
 
+      if(("add_line" %in% input$plot_options)){
+        p <- p + geom_line(data = week_choice_data %>% filter(!is.na(mean)), aes(y = mean), color = "grey", linewidth = 1, alpha = 0.4)
+      }
+
       #if incl_ex_days = T, then add in the extra data as points
-      if(input$incl_ex_days){
+      if(("incl_ex_days" %in% input$plot_options)){
         p <- p +
           geom_point(data = week_plus_data%>%filter(week != current_week()),
                      aes(y = mean, fill = final_status), shape = 21, stroke = 0, size = 1.5, alpha = 0.5)
@@ -597,14 +658,14 @@ server <- function(input, output, session) {
           color = "Sites" )+
         theme_bw(base_size = 14)
 
-      if(input$incl_thresholds){
+      if(("incl_thresholds" %in% input$plot_options)){
         p <- add_threshold_lines(plot = p,
                                  plot_data = week_plot_data,
                                  site_arg = input$site,
                                  parameter_arg = input$parameter)
       }
       # This is where the xlim is set, a problem -JD
-      if(input$incl_ex_days){
+      if(("incl_ex_days" %in% input$plot_options)){
         p <- p +
           scale_x_datetime(
             limits = c(min(week_plus_data$DT_round, na.rm = TRUE),
@@ -624,22 +685,26 @@ server <- function(input, output, session) {
           )
       }
 
-      if(input$plot_log10){
+      if(("plot_log10" %in% input$plot_options)){
         p <- p + scale_y_log10()
+      }
+
+      if(!("show_legend" %in% input$plot_options)) {
+        p <- p + theme(legend.position = "none")
       }
 
       p
     } else {
       # TODO: Swap with create weekly plot function call, adding in other sites, etc
 
-      if(input$remove_omit){
+      if(("remove_omit" %in% input$plot_options)){
         week_data <- week_data %>%
           filter(!brush_omit) # remove omitted data
 
         week_plus_data <- week_plus_data %>%
           filter(!brush_omit)
       }
-      if(input$remove_flag){
+      if(("remove_flag" %in% input$plot_options)){
         week_data <- week_data %>%
           filter(is.na(user_flag) & !brush_omit) # remove flagged data unless it is omitted - why keep omitted data?
 
@@ -650,7 +715,7 @@ server <- function(input, output, session) {
       p <-ggplot(week_data, aes(x = DT_round))
 
       #Adding in extra days (+- 2 days on each side)
-      if(input$incl_ex_days){
+      if(("incl_ex_days" %in% input$plot_options)){
         # check to make sure there is data from last week
         week_min_check <- week_plus_data %>%
           filter(week < current_week())
@@ -706,7 +771,7 @@ server <- function(input, output, session) {
             ungroup()
 
           #filter to just single week if incl_ex_days is false
-          if(!input$incl_ex_days){
+          if(!("incl_ex_days" %in% input$plot_options)){
             add_data_with_interpolation <- add_data_with_interpolation %>%
               filter(week == current_week())
           }
@@ -720,7 +785,7 @@ server <- function(input, output, session) {
         })
 
       # add in extra days if incl_ex_days is true
-      if(input$incl_ex_days){
+      if(("incl_ex_days" %in% input$plot_options)){
         p <- p + geom_point(data = week_plus_data%>%filter(week != current_week()), aes(y = mean),fill = "black",shape = 21, stroke = 0, size = 1.5, alpha = 0.5) #add two extra days on the side
       }
 
@@ -750,8 +815,8 @@ server <- function(input, output, session) {
           fill = "Flags")+
         theme_bw(base_size = 14)
 
-      if(input$add_line){
-        p <- p + geom_line(aes(y = mean), color = "grey", linewidth = 1)
+      if(("add_line" %in% input$plot_options)){
+        p <- p + geom_line(data = week_data %>% filter(!is.na(mean)), aes(y = mean), color = "grey", linewidth = 1)
       }
 
 
@@ -780,15 +845,19 @@ server <- function(input, output, session) {
 
       }
       #create plot
-      if(input$incl_thresholds){
+      if(("incl_thresholds" %in% input$plot_options)){
         p <- add_threshold_lines(plot = p,
                                  plot_data = week_plot_data,
                                  site_arg = input$site,
                                  parameter_arg = input$parameter)
       }
 
-      if(input$plot_log10){
+      if(("plot_log10" %in% input$plot_options)){
         p <- p + scale_y_log10()
+      }
+
+      if(!("show_legend" %in% input$plot_options)) {
+        p <- p + theme(legend.position = "none")
       }
 
       # Return the plot from renderPlot
@@ -800,7 +869,7 @@ server <- function(input, output, session) {
   ## Sub plots output
   # Anything that is flagged/omitted is removed, we want to keep flags and differentiate those points somehow -JD
   output$sub_plots <- renderPlotly({
-    req(all_datasets(), current_week(), input$site, input$sub_parameters, input$sub_sites)
+    req(all_datasets(), current_week(), input$site)
 
     pre_verification_data <- all_datasets()[["pre_verification_data"]]
     intermediary_data <- all_datasets()[["intermediary_data"]]
@@ -830,7 +899,9 @@ server <- function(input, output, session) {
     }
 
     # Create individual plots for each sub parameter
-    all_sub_plot_data <- map_dfr(input$sub_parameters, function(param) {
+    plots <- list()
+    if (length(input$sub_parameters) > 0) {
+      all_sub_plot_data <- map_dfr(input$sub_parameters, function(param) {
       map_dfr(all_sub_sites, function(sub_site) {
         # Get the relevant sonde data
         relevant_sondes <- map(sub_site, ~ {
@@ -988,6 +1059,38 @@ server <- function(input, output, session) {
       return(p)
     }) %>%
       compact() # remove any null plots
+    }
+
+    # Create USGS Flow Plot
+    flow_df <- usgs_flow_data()
+
+    if (!is.null(flow_df)) {
+      p_flow <- plot_ly()
+
+      # Add main site flow
+      main_site_flow <- flow_df %>% filter(site == input$site)
+      if (nrow(main_site_flow) > 0) {
+        p_flow <- p_flow %>%
+          add_lines(
+            data = main_site_flow,
+            x = ~datetime,
+            y = ~meas_value,
+            line = list(color = "black", width = 3),
+            name = unique(main_site_flow$abbrev)[1],
+            legendgroup = input$site,
+            showlegend = FALSE
+          )
+      }
+
+      p_flow <- p_flow %>%
+        layout(
+          xaxis = list(title = "Date"),
+          yaxis = list(title = "USGS Flow (cfs)", type = "log"),
+          margin = list(t = 80, b = 40)
+        )
+
+      plots <- c(plots, list(p_flow))
+    }
 
     if (length(plots) > 0) {
       # Filter out any NULL or invalid plots using keep
@@ -1063,6 +1166,55 @@ server <- function(input, output, session) {
 
   })
 
+  output$field_notes_table <- DT::renderDataTable({
+    req(current_week(), selected_data(), input$site)
+
+    week_data <- isolate(selected_data()) %>% filter(week == current_week())
+    week_min_day <- min(week_data$DT_round, na.rm = TRUE)
+    week_max_day <- max(week_data$DT_round, na.rm = TRUE)
+
+    # Use the existing meta folder path for this project
+    if(year(week_min_day) <= 2023){
+      # Use the existing meta folder path for this project
+      field_notes_path <- here(meta_path, "field_notes_21-22.parquet")
+
+    if (file.exists(field_notes_path)) {
+      notes <- arrow::read_parquet(field_notes_path)
+
+      # Try filtering by DT_round if it exists, otherwise by date or datetime
+      if ("DT_round" %in% names(notes)) {
+        notes <- notes %>% filter(DT_round >= week_min_day & DT_round <= week_max_day, site == input$site)
+      } else if ("datetime" %in% names(notes)) {
+        notes <- notes %>% filter(datetime >= week_min_day & datetime <= week_max_day, site == input$site)
+      }
+
+      # Rearrange columns so that visit comments is viewable
+      notes <- notes %>%
+        select(any_of(c("site", "date", "start_time_mst", "visit_comments", "visit_type")), everything())
+
+      DT::datatable(notes, options = list(pageLength = 10, scrollX = TRUE))
+    } else {
+      data.frame(Message = paste("Field notes file not found at", field_notes_path))
+    }
+
+    } else{
+      mWater_creds <- read_yaml(here("creds", "mWaterCreds.yml")) #this should be moved to global.R so that it is only read in once, but for now it is here
+      #otherwise use mWater field notes
+      mWater_data <- ross.wq.tools::load_mWater(creds = mWater_creds)
+      # Only extract sensor visits for our site during the current week
+      notes <- ross.wq.tools::grab_mWater_sensor_notes(mWater_api_data = mWater_data)%>%
+        filter(DT_round >= week_min_day & DT_round <= week_max_day, site == input$site) %>% # DT round is in MST
+        select(any_of(c("site", "date", "start_DT", "visit_comments", "visit_type")), everything())
+
+      if(nrow(notes) > 0) {
+        DT::datatable(notes, options = list(pageLength = 10, scrollX = TRUE))
+      } else {
+        data.frame(Message = "No field notes available for the selected week and site.")
+      }
+    }
+
+  })
+
   #### Brush Tools ####
 
   # Create a reactive value to store multiple brush selections
@@ -1104,43 +1256,13 @@ server <- function(input, output, session) {
   })
 
 
-  # Brush submit button UI
-  output$brush_submit_ui <- renderUI({
-    can_submit <- FALSE
+  # Helper function to apply brush actions
+  apply_brush_action <- function(action) {
+    req(brushed_areas(), selected_data())
 
-    #Can only click button if there is a brush selection and a decision has been made
-    if (!is.null(input$plot_brush) & !is.null(input$brush_action)) {
-
-      if(input$brush_action == "A"){
-        can_submit = TRUE
-      }else{
-        if(input$brush_action %in% c("F", "O")){
-          can_submit = FALSE
-          if(!is.null(input$user_brush_flags)){
-            can_submit = TRUE
-          }
-        }
-      }
-    }
-
-    actionButton(
-      "submit_brush",
-      "Submit Brush Decision",
-      class = ifelse(can_submit, "btn-success", "btn-secondary"),
-      disabled = !can_submit
-    )
-
-  })
-
-
-  # Modified submit observer
-  observeEvent(input$submit_brush, {
-    req(brushed_areas(), input$brush_action, selected_data())
-
-    user_brush_select <- input$brush_action
+    user_brush_select <- action
     # Initialize updated data with current data
     updated_data <- selected_data()
-
 
     #deal with empty brush areas
     if(is_empty(brushed_areas())){
@@ -1151,8 +1273,7 @@ server <- function(input, output, session) {
       brushed_areas(list())
       session$resetBrush("plot_brush")
       #reset input$user_brush_flags to nothing
-      updateRadioButtons(session, "user_brush_flags", selected = "")
-
+      updateSelectizeInput(session, "user_brush_flags", selected = "")
 
       showNotification("No Points Brushed, no changes applied", type = "message")
 
@@ -1208,10 +1329,30 @@ server <- function(input, output, session) {
       brushed_areas(list())
       session$resetBrush("plot_brush")
       #reset input$user_brush_flags to nothing
-      updateRadioButtons(session, "user_brush_flags", selected = "")
+      updateSelectizeInput(session, "user_brush_flags", selected = "")
 
       showNotification("Brush Changes saved.", type = "message")
     }
+  }
+
+  observeEvent(input$btn_accept_brush, {
+    apply_brush_action("A")
+  })
+
+  observeEvent(input$btn_flag_brush, {
+    if (is.null(input$user_brush_flags)) {
+      showNotification("Please select at least one flag.", type = "warning")
+      return()
+    }
+    apply_brush_action("F")
+  })
+
+  observeEvent(input$btn_omit_brush, {
+    if (is.null(input$user_brush_flags)) {
+      showNotification("Please select at least one flag.", type = "warning")
+      return()
+    }
+    apply_brush_action("O")
   })
 
 

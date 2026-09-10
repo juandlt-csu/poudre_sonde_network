@@ -6,7 +6,7 @@
 #' @param summarize_interval At what time interval the user would like the data set to be aggregated and rounded to. Default is 15 minutes.
 #' @return A dataframe with the field notes.
 
-load_mWater_notes <- function(creds = yaml::read_yaml("creds/mWaterCreds.yml"), summarize_interval = "15 minutes"){
+load_mWater_notes <- function(creds = yaml::read_yaml(here::here("creds", "mWaterCreds.yml")), summarize_interval = "15 minutes"){
 
   # API Pull of mWater submitted notes
 

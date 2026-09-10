@@ -93,7 +93,7 @@ relevant_sonde_selector <- function(site_arg) {
 
 get_auto_parameters <- function(parameter) {
   tryCatch({
-     read_csv(here("manual_verification_tool", "data", "meta", "parameter_autoselections.csv"), show_col_types = F) %>%
+     read_csv(file.path(meta_path, "parameter_autoselections.csv"), show_col_types = F) %>%
       filter(main_parameter == parameter) %>%
       pull(sub_parameters) %>%
       first() %>%

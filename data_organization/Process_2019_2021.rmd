@@ -802,7 +802,7 @@ v_final_flags <- final_flags%>%
 
 ## 11) Save processed data
 
-### Save to flagged folder
+  ### Save to flagged folder
 
 ```{r}
 # Save files
@@ -984,13 +984,17 @@ We will be creating two datasets here:
 
 ```{r}
 
-years <- c(2019, 2020, 2021)
-hydro_share_datasets <- map(years, ~function(year_cycle){
-  
-  
-drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", paste0(year_cycle, "_cycle"),"/post_verification/"), pattern = "*.parquet", full.names = TRUE)
+years <- c(2019, 2020, 2021)%>%paste0("_cycle")
 
-drift_corrected_data <- map_dfr(drift_corrected_files, read_parquet)%>%
+hydro_share_datasets <- map(years, function(year_cycle){
+  
+  
+drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", year_cycle,"/post_verification/"), pattern = "*.parquet", full.names = TRUE)
+
+drift_corrected_data <- map_dfr(drift_corrected_files, 
+                                ~read_parquet(.x)%>% 
+                                  ross.wq.tools::add_column_if_not_exists(., "pre_post_source")%>%
+                                  mutate(pre_post_source = as.character(pre_post_source)))%>%
   select(DT_round, DT_join, site, parameter,units, 
          value_raw = mean,  
          value_post_ver = mean_analysis, 
@@ -999,9 +1003,9 @@ drift_corrected_data <- map_dfr(drift_corrected_files, read_parquet)%>%
   split(f = list(.$site, .$parameter), sep = "-")%>%
   keep(~ nrow(.x) > 0) #remove any empty datasets
 
-non_drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", paste0(year_cycle, "_cycle"), "/verified_directory/"), pattern = "*.parquet", full.names = TRUE)
+non_drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", year_cycle, "in_progress/verified_directory/"), pattern = "*.parquet", full.names = TRUE)
 
-non_drift_corrected_data <- map_dfr(non_drift_corrected_files, read_parquet)%>%
+non_drift_corrected_data <- map_dfr(non_drift_corrected_files, ~read_parquet(.))%>%
   mutate( mean_analysis = ifelse(verification_status %in% c("FLAGGED", "PASS"), mean, NA))%>%
   select(DT_round, DT_join, site, parameter,units,
          value_raw = mean, 
@@ -1035,84 +1039,170 @@ raw_dataset <- all_datasets%>%
          value_post_drift_corr = round(value_post_drift_corr, 3),
          #Create modifications column to indicate what modifications were made to the data for easier filtering and analysis downstream
          modifications = case_when( is.na(value_post_ver) & !is.na(value_raw) ~ "manual data exclusion",
-                                    value_raw == value_post_cal_corr & value_post_ver != value_post_drift_corr ~ "drift correction",
+                                    value_post_ver != value_post_drift_corr ~ "drift correction",
                                     TRUE ~ NA), 
          #convert to UTC
          DateTime_UTC = with_tz(DT_round, tzone = "UTC"))%>%
   select(-units)%>%
   left_join(units_table, by = "parameter")%>%
-  select(DateTime_MST = DT_round,
-         DateTime_UTC,
+  select(DateTime_UTC,
          site, parameter, units, 
          #Actual data
          value_raw, 
          value_post_ver,
          value_post_drift_corr, 
          #QC Info
-         auto_qc_flag, mal_flag, user_qc_flag, qc_status, modifications)
+         auto_qc_flag, mal_flag, user_qc_flag, qc_status, modifications)%>%
+  distinct(.keep_all = TRUE)
     
 final_dataset <- raw_dataset %>%
-  select(DateTime_UTC, site, parameter, units, value_raw, value_final = value_post_drift_corr,user_qc_flag, modifications)
+  select(DateTime_UTC, site, parameter, units, value_raw, value_final = value_post_drift_corr,user_qc_flag, modifications)%>%
+  distinct(.keep_all = TRUE)
 
 return(list(raw_dataset = raw_dataset, final_dataset = final_dataset))
-})
+})%>%
+  set_names(years)
 ```
 
 #### Plot to Double Check 
 
 ```{r}
 # 
-# plots <- map(unique(final_dataset$site), function(site_name) {
-#   ggplot(final_dataset %>% filter(site == site_name), aes(x = DateTime_UTC, y = value_final, color = modifications)) +
-#     geom_point(aes(y = value_raw), color = "gray", alpha = 0.5) + # add raw data points for comparison
-#     geom_point() +
-#     facet_wrap(~parameter, scales = "free_y") +
-#     labs(title = site_name,
-#          x = "Date",
-#          y = "Value",
-#          color = "QC Status")
-# })
-# walk(plots, print)
+final_dataset <- map(hydro_share_datasets, "final_dataset")%>%
+  bind_rows()%>%
+  filter(!is.na(value_final))
 
+plots <- map(unique(final_dataset$site), function(site_name) {
+  ggplot(final_dataset %>% filter(site == site_name), aes(x = DateTime_UTC, y = value_final, color = modifications)) +
+    geom_point(aes(y = value_raw), alpha = 0.5) + # add raw data points for comparison
+    geom_point() +
+    facet_wrap(~parameter, scales = "free_y") +
+    labs(title = site_name,
+         x = "Date",
+         y = "Value",
+         color = "QC Status")
+})%>%
+  set_names(unique(final_dataset$site))
+walk(plots, print)
+
+
+#plot specific site and parameter
+final_dataset%>%
+  filter(site == "archery", parameter == "Specific Conductivity")%>%
+  ggplot(aes(x = DateTime_UTC, y = value_final, color = modifications)) +
+  geom_point(aes(y = value_raw), alpha = 0.5) + # add raw data points for comparison
+  geom_point() +
+  labs(title = "Archery - Turbidity",
+       x = "Date",
+       y = "Value",
+       color = "QC Status")
 ```
 
 
 ### Save Data
 
 ```{r}
-# year <- "2019"
+
+for(year in c("2019", "2020", "2021")){
+  year_cycle = paste0(year, "_cycle")
+  
+  final_dataset <- hydro_share_datasets[[year_cycle]][["final_dataset"]]
+  raw_dataset <- hydro_share_datasets[[year_cycle]][["raw_dataset"]]
+
 # 
-# #check if the folder exists, if not create it
-# if (!dir.exists(here( "data/collated/sensor/hydroshare_pub", year))) {
-#   dir.create(here( "data/collated/sensor/hydroshare_pub", year), recursive = TRUE)
-# }
-# 
-# cleaned_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_cleaned.csv"))
-# 
-# raw_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.csv"))
-# 
-# write_csv(final_dataset, cleaned_file_name)
-# 
-# write_csv(raw_dataset, raw_file_name)
+#check if the folder exists, if not create it
+if (!dir.exists(here( "data/collated/sensor/hydroshare_pub", year))) {
+  dir.create(here( "data/collated/sensor/hydroshare_pub", year), recursive = TRUE)
+}
+
+cleaned_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_cleaned.csv"))
+
+raw_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.csv"))
+
+write_csv(final_dataset, cleaned_file_name)
+
+write_csv(raw_dataset, raw_file_name)
+# Repeat for parquet files
+cleaned_file_name_parquet <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_cleaned.parquet"))
+
+raw_file_name_parquet <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.parquet"))
+
+write_parquet(final_dataset, cleaned_file_name_parquet)
+
+write_parquet(raw_dataset, raw_file_name_parquet)
+}
 ```
 
 ## Field Notes
 
 ```{r}
-# sensor_field_notes <- grab_mWater_sensor_notes(load_mWater())%>%
-#   filter(year(DT_round) == year & !(site %in% c("springcreek", "boxcreek")))%>%
-#   rename(DateTime_UTC = DT_round) %>%
-#   select(-photos_downloaded,-DT_join, -cal_report_collected, -sensor_swapped_notes, -end_dt, -last_site_visit, -date,-sensor_deployed, -sensor_pulled)%>%
-#   #Clean up crew to just initials and remove any extra text
-#   mutate(crew = crew %>%
-#     str_replace_all("Other \\(please specify\\)", "Other") %>%
-#     str_replace_all("([A-Z])[a-z]+", "\\1") %>%
-#     str_replace_all("(?<=[A-Z])\\s+(?=[A-Z])", "")
-#   )
-# 
-# field_notes_file <- here("data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_sensor_field_notes_", year, ".csv"))
-# 
-# write_csv(sensor_field_notes, field_notes_file)
+
+old_field_notes <- readxl::read_excel(here("data","raw","field_notes","sensor_field_notes.xlsx")) %>% 
+  mutate(DT = (paste0(date, " ", start_time_mst))) %>%
+  mutate(DT = ymd_hm(DT) + hours(7)) %>%
+  arrange(DT) %>%
+  mutate(DT_round = round_date(DT, "15 minutes")) %>%
+  mutate(DT_round = with_tz(DT_round, tzone = "UTC"),
+         last_site_visit = with_tz(DT_round, tzone = "UTC"),
+         DT_join = as.character(DT_round),
+         sonde_moved = NA,
+         sonde_employed = case_when(is.na(sensor_deployed) & is.na(sensor_pulled) ~ NA,
+                                    sensor_deployed == "x" ~ 0, 
+                                    sensor_pulled == "x" ~ 1), 
+         site = ifelse(site == "rist", "bellvue", site)) %>%
+  ross.wq.tools::fix_site_names()%>%
+  #add extra cols
+  mutate(rdo_pre_clean = NA, 
+         rdo_post_clean = NA,
+         rdo_post_cal = NA,
+         cond_pre_clean = NA,
+         cond_post_clean = NA,
+         cond_post_cal = NA,
+         ph_pre_clean = NA,
+         ph_post_clean = NA,
+         ph_post_cal = NA,
+         orp_pre_clean = NA,
+         orp_post_clean = NA,
+         orp_post_cal = NA,
+         turb_pre_clean = NA,
+         turb_post_clean = NA,
+         turb_post_cal = NA,
+         fdom_pre_clean = NA,
+         fdom_post_clean = NA,
+         fdom_post_cal = NA,
+         chla_pre_clean = NA,
+         chla_post_clean = NA,
+         chla_post_cal = NA)%>%
+  select(-sensors_cleaned, -wiper_working, -cal_report_collected)%>%
+  filter(DT_round <= ymd("2021-12-31"))
+
+formatted_notes <- old_field_notes%>%
+  filter(!(site %in% c("springcreek", "boxcreek", "mountaincampus")))%>%
+  rename(DateTime_UTC = DT_round) %>%
+  select(-any_of(c("photos_downloaded","DT_join", "cal_report_collected", "sensor_swapped_notes", "end_dt", "last_site_visit", "date","sensor_deployed", "sensor_pulled")))%>%
+  select(any_of(c("site",  "crew","DateTime_UTC", "sonde_employed", "sensors_cleaned", "wiper_working",
+                  "rdo_cap_condition", "rdo_cap_replaced", "ph_junction_replaced", "cals_performed",
+                  "sonde_moved", "sensor malfunction", "visit_type", "start_DT", "visit_comments", 
+                  "rdo_pre_clean",   "rdo_post_clean", "rdo_post_cal",
+                  "cond_pre_clean", "cond_post_clean", "cond_post_cal",
+                  "ph_pre_clean", "ph_post_clean", "ph_post_cal",
+                  "orp_pre_clean", "orp_post_clean", "orp_post_cal",
+                  "turb_pre_clean", "turb_post_clean", "turb_post_cal",
+                  "fdom_pre_clean", "fdom_post_clean", "fdom_post_cal",
+                  "chla_pre_clean", "chla_post_clean", "chla_post_cal")))%>%
+  #Clean up crew to just initials and remove any extra text
+  mutate(crew = crew %>%
+    str_replace_all("Other \\(please specify\\)", "Other") %>%
+    str_replace_all("([A-Z])[a-z]+", "\\1") %>%
+    str_replace_all("(?<=[A-Z])\\s+(?=[A-Z])", "")
+  )%>%
+  fix_site_names()
+
+#Only 2021 had field notes
+  
+  field_notes_file_name <- here( "data/collated/sensor/hydroshare_pub/2021/CSU_ROSS_2021_field_notes.csv")
+  
+  write_csv(formatted_notes, field_notes_file_name)
 
 ```
 
@@ -1123,6 +1213,8 @@ return(list(raw_dataset = raw_dataset, final_dataset = final_dataset))
 Here we will load and double check the location metadata file created by Sam Struthers and verified by Katie Willi
 
 ```{r}
+location_meta <- read_csv("data/collated/sensor/hydroshare_pub/CSU_ROSS_sonde_location_metadata.csv")
+
 # location_meta <- read_csv("data/collated/sensor/hydroshare_pub/CSU_ROSS_sonde_location_metadata.csv",
 #                            show_col_types = FALSE)%>%
 #   mutate(data_start_date = as.POSIXct(data_start_date, tz = "UTC", format = "%m/%d/%y"),

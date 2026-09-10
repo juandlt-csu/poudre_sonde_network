@@ -1,0 +1,688 @@
+---
+title: "2022_data-deconfliction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is the workflow for deconflicting 2022 Poudre Sonde Network data. This data was collected before our current protocol was produced, and therefore requires a slightly different workflow for performing our auto-QAQC pipeline. Certain factors which necessitate this workflow include:
+- Timezone issues throughout multiple datasets
+- Inconsistent data formatting across different sources
+- Mix of manual datasets (e.g., .csv, .txt, .xlsx) and automated datasets (.htm)
+- Duplicate files within the log folder
+
+## 1) Set-up
+
+### 1.1) Package Load
+```{r}
+# load required packages
+package_loader <- function(x) {
+  if (x %in% installed.packages()) {
+    suppressMessages({
+      library(x, character.only = TRUE)
+    })
+  } else {
+    suppressMessages({
+      install.packages(x)
+      library(x, character.only = TRUE)
+    })
+  }
+}
+non_cran_packages <- c("rossyndicate/ross.wq.tools")
+invisible(
+  lapply(non_cran_packages, function(x) {
+    pack_name <- unlist(strsplit(x, "/"))[2] #get package name (no GH username)
+    
+    if (pack_name %in% installed.packages()) {
+      suppressMessages({
+        library(pack_name, character.only = TRUE)
+      })
+    } else {
+      suppressMessages({
+        devtools::install_github(x)
+        library(pack_name, character.only = TRUE)
+      })
+    }
+  })
+)
+# load all required packages
+invisible(
+  lapply(c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo", "ggpubr",
+           "plotly", "padr", "stats", "RcppRoll", "yaml", "here", "furrr", "ross.wq.tools"),
+         package_loader)
+)
+
+```
+
+### 1.2) Parallel Compute Configuration
+```{r}
+# Configure parallel processing
+max_workers <- 4  # Maximum number of parallel workers
+num_workers <- min(availableCores() - 1, max_workers)
+plan(multisession, workers = num_workers)
+furrr_ops <- furrr_options(globals = TRUE,
+                           packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+                                        "padr", "stats", "RcppRoll", "yaml", "here", "ross.wq.tools")
+                           )
+```
+
+## 2) Credentials, Thresholds, Field Notes
+
+### 2.1) Credentials
+```{r}
+# Configure your credentials files
+mwater_creds_file <- here("creds","creds","mWaterCreds.yml")
+mWater_creds <- read_yaml(mwater_creds_file)
+
+# pull field data from mWater API
+mWater_data <- load_mWater(creds = mWater_creds)
+
+# grab sensor malfunction records - so auto-QAQC works.
+sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data) %>%
+  mutate(start_DT = with_tz(start_DT, tzone = "UTC"),
+         end_DT = with_tz(end_DT, tzone = "UTC"))
+
+```
+
+### 2.2) Thresholds
+```{r}
+# Read in the threshold data first
+sensor_thresholds <- read_yaml(here("data","derived","auto_qaqc_files", "thresholds", "sensor_spec_thresholds.yml"))
+season_thresholds <- read_csv(here("data","derived","auto_qaqc_files", "thresholds", "seasonal_thresholds20260304-T175010Z.csv"), show_col_types = FALSE) %>%
+  fix_site_names()
+```
+
+### 2.3) Directories and Field Notes
+```{r}
+base_dir <- here("data","raw", "sensor","manual_data_verification","2022_cycle")
+meta_folder_path <- here(base_dir, "in_progress","meta")
+# Folder with downloaded logs
+log_dir <- here("data","raw", "sensor", "log_download", "2022")
+decon_log_dir <- here(log_dir, "deconflict_logs")
+
+all_field_notes <- read_parquet(here(meta_folder_path, "field_notes_21-22.parquet")) %>%
+  filter(date >= as.Date("2022-01-01"),
+         date <= as.Date("2022-12-31")) %>%
+  ross.wq.tools::fix_site_names()
+```
+
+## 3) Raw Data Ingest & Standardization
+
+### 3.1) Ingest Data
+
+#### 3.1.1) Rist (Bellvue)
+
+- Start: 2022-04-22
+- End: 2022-05-24
+- Notes: 
+  - Sensor “capped” during low flow period. Damaged during peak flows and not re-installed during 2022.
+  - Sonde housing destroyed sometime before 2022-05-24
+
+```{r}
+# OG timezone in UTC
+bellvue_final <- xml2::read_html(here::here(decon_log_dir, "bellvue_all_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  # Sensor pulled 2022-05-30 after sensor housing destroyed
+  dplyr::filter(DT_round <= ymd("2022-05-25")) %>%
+  # Sensor also capped from 5/6/2022 - 5/9/2022 (flow too low) (timezone in UTC)
+  dplyr::filter(!(DT_round >= ymd_hms('2022-05-06 18:00:00') & DT_round <= ymd_hms('2022-05-09 20:30:00'))) %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "bellvue",
+                id = "bellvue",
+                name = "bellvue") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT))
+
+ggplot(data = bellvue_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.2) Legacy (Salyer)
+
+- Start: 2022-04-07
+- End: 2022-09-19
+- Notes:
+    - 2022-05-24: Pulled due to questionable housing integrity
+    - 2022-06-01: Redeployed
+    - 2022-07-08: Pulled (turbidity & conductivity problems)
+    - Between 2022-07-08 & 2022-07-12: turbidity sensor completely breaks; replaced with sensor previously used at archery
+    - Between 2022-07-18 & 2022-07-21: back-up sensor stopped working
+    - 2022-08-03: Sonde swapped w/ rist
+    - 2022-08-03/2022-08-04: Sensor suspended out of water
+    - 2022-08-04: Sonde pulled due to low flows
+    - 2022-08-25: Redeployed; continued turbidity & ORP issues until end of season
+    
+```{r}
+# Legacy; UTC tz
+salyer_1 <- xml2::read_html(here(decon_log_dir, "salyer_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+salyer_2 <- xml2::read_html(here(decon_log_dir, "salyer_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+salyer_final <- dplyr::bind_rows(salyer_1, salyer_2) %>% 
+  # Remove data ranges where sensor was pulled out of field based on notes (UTC Time)
+  dplyr::filter(!((DT_round) >= ('2022-05-24 15:30:00') & (DT_round) < ('2022-06-01 19:30:00')),
+              !((DT_round) > ('2022-07-08 20:00:00') & (DT_round) <= ('2022-07-12 16:00:00')),
+              !((DT_round) >= ('2022-08-04 15:50:00') & (DT_round) <= ('2022-08-25 22:15:00'))) %>%
+  dplyr::mutate(site = "salyer",
+                id = "salyer",
+                name = "salyer") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
+
+ggplot(data = salyer_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.3) Lincoln (Udall)
+
+- Start: 2022-03-24
+- End: 2022-07-22
+- Notes:
+    - Site ran by in-situ
+    - Excel of data sent mid season and not again until end of season, so data is pretty spotty.
+
+```{r}
+# OG in UTC even though vu-situ file states -6hr offset from UTC (validated with water temperature)
+udall_raw <- readxl::read_excel(here::here(decon_log_dir, "lincoln_all_2022.xlsx"))
+
+udall_final <- udall_raw %>%
+  dplyr::mutate(DT_round = lubridate::round_date(DT, "15 minutes")) %>%
+  tidyr::pivot_longer(-c("DT", "DT_round"), names_to = "parameter", values_to = "value") %>%
+  dplyr::mutate(value = as.numeric(value),
+                # Target units
+                units = dplyr::case_when(parameter == "Temperature" ~ "C",
+                                         parameter == "pH" ~ "pH",
+                                         parameter == "ORP" ~ "V",
+                                         parameter == "Depth" ~ "m",
+                                         parameter == "Specific Conductivity" ~ "µS/cm",
+                                         parameter == "DO" ~ "mg/L",
+                                         parameter == "Turbidity" ~ "NTU"),
+                # Convert values to new units
+                value = dplyr::case_when(parameter == "DO" ~ value, # ppm is equivalent to mg/L for dissolved oxygen
+                                         parameter == "Depth" ~ value * 0.3048, # feet to meters
+                                         parameter == "ORP" ~ value / 1000, # millivolts to volts
+                                         TRUE ~ value),
+                # Fix site/id/name from lincoln to udall
+                site = "udall",
+                id = "udall",
+                name = "udall"
+                ) %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units) %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(parameter)) %>%
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
+
+ggplot(data = udall_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.4) Timberline (Riverbend)
+
+- Start: 2022-04-06
+- End: 2022-11-15
+- Notes:
+
+```{r}
+# Timberline; UTC
+riverbend_final <- xml2::read_html(here(decon_log_dir, "riverbend_all_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "riverbend",
+                id = "riverbend",
+                name = "riverbend") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT))
+
+ggplot(data = riverbend_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.5) Prospect (Cottonwood)
+
+- Start: 2022-04-30
+- End: 2022-11-15
+- Notes:
+
+```{r}
+# Prospect; UTC
+cottonwood_final <- xml2::read_html(here(decon_log_dir, "cottonwood_all_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "cottonwood",
+                id = "cottonwood",
+                name = "cottonwood") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT))
+  
+ggplot(data = cottonwood_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.6) Boxelder (ELC)
+
+- Start: 2022-04-23
+- End: 2022-11-15
+- Notes:
+    - 2022-05-26: Pulled due to unsuitable site (elc_1_2022.htm & elc_2_2022.htm contains data from this deployment in -6hr UTC offset)
+    - 2022-07-27: Re-deployed near boxelder WWTP outfall; continued issues with turbidity and ORP until end of season (elc_3_2022.htm contains data from this deployment in UTC)
+
+```{r}
+elc_1 <- xml2::read_html(here(decon_log_dir, "elc_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6))
+
+elc_2 <- xml2::read_html(here(decon_log_dir, "elc_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6))
+
+elc_3 <- xml2::read_html(here(decon_log_dir, "elc_3_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+elc_final <- elc_1 %>%
+  dplyr::bind_rows(elc_2) %>%
+  dplyr::bind_rows(elc_3) %>%
+  dplyr::mutate(site = "elc",
+                id = "elc",
+                name = "elc",
+                unit = if_else(parameter == "Temperature", "C", unit)) %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
+
+ggplot(data = elc_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.7) Archery
+
+- Start: 2022-04-06
+- End: 2022-11-15
+- Notes:
+    - Swapped w/ back-up sensor (Fossil Creek) due to early season issues with Chl-a, temp, cond.
+    - Between 2022-07-01 & 2022-07-06: Burried
+    - 2022-07-14: Unclogged
+    - 2022-10-04 & 2022-10-07: Sensor capped
+
+```{r}
+#OG data in UTC.
+archery_1 <- xml2::read_html(here(decon_log_dir, "archery_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+archery_2 <- xml2::read_html(here(decon_log_dir, "archery_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+archery_final <- dplyr::bind_rows(archery_1, archery_2) %>% 
+  dplyr::filter(!((DT_round) >= ('2022-10-04 21:00:00') & (DT_round) < ('2022-10-07 00:00:00'))) %>%
+  dplyr::mutate(site = "archery",
+                id = "archery",
+                name = "archery") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
+
+ggplot(data = archery_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+### 3.2) Standardize Data
+
+#### 3.2.1) Combine Site Data
+ 
+```{r}
+all_sites <- bind_rows(bellvue_final, salyer_final, udall_final, riverbend_final, 
+                       cottonwood_final, elc_final, archery_final)
+```
+
+#### 3.2.2) Depth Mis-calibration Correction
+
+```{r}
+# Salyer depth corrections
+salyer_depth_corrected <- all_sites %>%
+    filter(parameter == "Depth",
+           site == "salyer") %>%  
+  # UTC to MST conversion to link with field notes
+  mutate(DT = with_tz(DT, tzone = "MST")) %>%
+  # First correction: 2022-04-06 to 2022-04-12
+  mutate(value_p1 = ifelse(DT >= ymd_hms('2022-04-06 06:00:00', tz = 'MST') & DT < ymd_hms('2022-04-12 9:20:00', tz = 'MST'), 
+                           value + abs(filter(., DT == ymd_hms('2022-04-12 09:15:00', tz = "MST"))$value 
+                                       - filter(., DT == ymd_hms('2022-04-12 16:30:00', tz = "MST"))$value), 
+                           value)
+         ) %>%
+  # Second correction: 2022-07-22 to 2022-07-25
+  #timestamp > ymd_hms('2022-07-22 16:45:00') & timestamp < ymd_hms('2022-07-25 21:29:00')
+  mutate(value_p2 = ifelse(DT > ymd_hms('2022-07-22 09:45:00', tz = 'MST') & DT < ymd_hms('2022-07-25 14:29:00', tz = 'MST'), 
+                           value_p1 + abs(filter(., DT == ymd_hms('2022-07-25 14:15:00', tz = "MST"))$value_p1 
+                                          - filter(., DT == ymd_hms('2022-07-25 14:29:00', tz = "MST"))$value_p1), 
+                           value_p1)
+         ) %>%
+  mutate(value = value_p2) %>%
+  select(-value_p1, 
+         -value_p2) %>%
+  # Convert timestamp back to UTC
+  mutate(DT = with_tz(DT, tzone = "UTC"))
+
+```
+
+```{r}
+# Riverbend depth corrections
+# weird mis-calibration
+riverbend_depth_corrected <- all_sites %>%
+  filter(parameter == "Depth",
+         site == "riverbend") %>%
+  # UTC to MST conversion to link with field notes
+  mutate(DT = with_tz(DT, tzone = "MST")) %>%
+  # First correction: 2022-04-06 to 2022-04-07
+  mutate(value_p1 = ifelse(DT >= ymd_hms('2022-04-06 07:00:00', tz = 'MST') & DT < ymd_hms('2022-04-07 16:56:00', tz = 'MST'), 
+                           value + abs(filter(., DT == ymd_hms('2022-04-07 16:15:00', tz = 'MST'))$value 
+                                       - filter(., DT == ymd_hms('2022-04-07 17:15:00', tz = 'MST'))$value), 
+                           value)
+         ) %>% 
+  # purposefully shifted sonde up in housing:
+  # Second correction: after 2022-09-14
+  mutate(value_p2 = ifelse(DT >= ymd_hms('2022-09-14 13:15:00', tz = 'MST'), 
+                           value_p1 + abs(filter(., DT == ymd_hms('2022-09-14 13:00:00', tz = "MST"))$value_p1 
+                                          - filter(., DT == ymd_hms('2022-09-14 13:15:00', tz = "MST"))$value_p1),
+                           value_p1)
+         ) %>%
+  mutate(value = value_p2) %>%
+  select(-value_p1,
+         -value_p2) %>%
+  # Convert timestamp back to UTC
+  mutate(DT = with_tz(DT, tzone = "UTC"))
+
+```
+
+```{r}
+# combine corrected depths with original data
+all_sites_corrected <- all_sites %>%
+  filter(!(parameter == "Depth" & site == "salyer")) %>%
+  filter(!(parameter == "Depth" & site == "riverbend")) %>%
+  bind_rows(salyer_depth_corrected, riverbend_depth_corrected) %>%
+  arrange(site, DT, parameter)
+```
+
+```{r}
+# Red indicates the complete corrected depth time series
+# Black indicates the original depth mis-calibrations
+plotly::ggplotly(ggplot() +
+  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("salyer")), aes(x = DT, y = value), color = "black")+
+  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("salyer")), aes(x = DT, y = value),linetype = "solid", color = "red"))
+
+plotly::ggplotly(ggplot() +
+  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("riverbend")), aes(x = DT, y = value), color = "black")+
+  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("riverbend")), aes(x = DT, y = value),linetype = "solid", color = "red"))
+```
+
+```{r}
+### Check old data with corrected data
+
+old_data <- read_parquet(here('data', 'raw', 'sensor', "manual_data_verification", '2022_cycle', 'ip', 'raw_data', 'raw_data_2022.parquet')) |> 
+  group_by(site, parameter)
+
+new_data <- read_parquet(here('data', 'raw', 'sensor', "manual_data_verification", '2022_cycle', 'in_progress', 'raw_data', 'raw_data_2022.parquet')) |> 
+  group_by(site, parameter)
+
+# 1. Create a unique grouping ID for both dataframes 
+# This ensures our list names match perfectly when we split them
+old_data <- old_data %>% mutate(group_id = paste(site, parameter, sep = "_"))
+new_data <- new_data %>% mutate(group_id = paste(site, parameter, sep = "_"))
+
+# 2. Split the dataframes into named lists
+# The drop = TRUE argument removes empty combinations if a site doesn't have a certain parameter
+old_list <- split(old_data, old_data$group_id, drop = TRUE)
+new_list <- split(new_data, new_data$group_id, drop = TRUE)
+
+# 3. Identify combinations that exist in BOTH lists to prevent errors
+common_groups <- intersect(names(old_list), names(new_list))
+
+# 4. Iterate through the common groups and compare
+# purrr::map will apply this comparison function to every site_parameter group
+mismatches_list <- map(common_groups, function(grp) {
+  
+  df_old <- old_list[[grp]]
+  df_new <- new_list[[grp]]
+  
+  df_old %>%
+    inner_join(df_new, by = "DT_round", suffix = c("_old", "_new")) %>%
+    mutate(
+      # The comma has been removed from is.na(mean_old)
+      is_diff = !near(mean_old, mean_new) | (is.na(mean_old) != is.na(mean_new))
+    ) %>%
+    filter(is_diff) %>%
+    select(DT_round, site_old, parameter_old, mean_old, mean_new) %>%
+    rename(site = site_old, parameter = parameter_old)
+  
+}) %>% 
+  set_names(common_groups)
+```
+
+```{r}
+# 5. Build a plotly comparison (old vs. new) for each site/parameter combo
+comparison_plots <- map(common_groups, function(grp) {
+
+  df_old <- old_list[[grp]] %>%
+    ungroup() %>%
+    select(DT_round, mean) %>%
+    rename(old_data = mean)
+
+  df_new <- new_list[[grp]] %>%
+    ungroup() %>%
+    select(DT_round, mean) %>%
+    rename(new_data = mean)
+
+  plot_data <- full_join(df_old, df_new, by = "DT_round") %>%
+    arrange(DT_round)
+
+  plot_ly(plot_data, x = ~DT_round) %>%
+    add_lines(y = ~old_data, name = "old_data", line = list(color = "black")) %>%
+    add_lines(y = ~new_data, name = "new_data", line = list(color = "red")) %>%
+    layout(title = grp,
+           xaxis = list(title = "Date"),
+           yaxis = list(title = "Value"))
+
+}) %>%
+  set_names(common_groups)
+
+# Example: view a single site/parameter comparison
+comparison_plots[["archery_Temperature"]]
+comparison_plots[["bellvue_Temperature"]]
+comparison_plots[["cottonwood_Temperature"]]
+comparison_plots[["elc_Temperature"]]
+comparison_plots[["riverbend_Temperature"]]
+comparison_plots[["salyer_Temperature"]]
+comparison_plots[["udall_Temperature"]]
+```
+
+```{r}
+library(arrow)
+library(plotly)
+library(tidyverse)
+
+verified_dir <- "~/github/poudre_sonde_network/data/raw/sensor/manual_data_verification/2022_cycle/ip/verified_directory"
+
+verified_files_all <- list.files(verified_dir, pattern = "\\.parquet$", full.names = TRUE)
+
+# Read and combine every verified file into one long data frame
+# (DT_join is coerced to character since it's stored as either character or
+# datetime depending on the file)
+verified_data_all <- map(
+  verified_files_all,
+  ~ read_parquet(.x) %>% as_tibble() %>% mutate(DT_join = as.character(DT_join))
+) %>%
+  bind_rows() %>%
+  # Prefer the verified/corrected value where available, fall back to raw mean
+  mutate(value = coalesce(mean_verified, mean)) %>%
+  # Drop points flagged as OMIT in the final decision
+  filter(final_status != "OMIT" | is.na(final_status))
+
+# One subplot (stacked, shared x-axis) per parameter, combined by site
+site_plots <- verified_data_all %>%
+  group_by(site) %>%
+  group_split() %>%
+  set_names(map_chr(., ~ unique(.x$site))) %>%
+  map(function(df) {
+    param_plots <- df %>%
+      group_by(parameter) %>%
+      group_split() %>%
+      set_names(map_chr(., ~ unique(.x$parameter))) %>%
+      map(function(df_param) {
+        units <- unique(df_param$units)[1]
+        plot_ly(df_param, x = ~DT_round, y = ~value, type = "scatter", mode = "lines",
+                name = unique(df_param$parameter)) %>%
+          layout(yaxis = list(title = paste0(unique(df_param$parameter), " (", units, ")")))
+      })
+
+    subplot(param_plots, nrows = length(param_plots), shareX = TRUE, titleY = TRUE) %>%
+      layout(title = unique(df$site))
+  })
+
+# Example: view a single site's combined plot
+site_plots[["archery"]]
+```
+
+```{r}
+# Compare Temperature across all sites on one plot
+temp_all_sites <- verified_data_all %>%
+  filter(parameter == "Temperature")
+
+plot_ly(temp_all_sites, x = ~DT_round, y = ~value, color = ~site,
+        type = "scatter", mode = "lines") %>%
+  layout(title = "Temperature by site",
+         xaxis = list(title = "Date"),
+         yaxis = list(title = paste0("Temperature (", unique(temp_all_sites$units)[1], ")")))
+```
+
+```{r}
+library(slider)
+
+# Smooth Temperature with a centered 2-hour time-based rolling mean before
+# finding each day's peak, to avoid short-lived weather noise (e.g. a brief
+# cloud break) masquerading as the diel peak. slide_index is used (rather than
+# a fixed n-point window) since sampling interval isn't identical across sites.
+temp_smoothed <- verified_data_all %>%
+  filter(parameter == "Temperature", !is.na(value)) %>%
+  arrange(site, DT_round) %>%
+  group_by(site) %>%
+  mutate(
+    value_smooth = slide_index_dbl(
+      value, DT_round,
+      ~ mean(.x, na.rm = TRUE),
+      .before = lubridate::hours(1), .after = lubridate::hours(1)
+    )
+  ) %>%
+  ungroup()
+
+temp_peaks_smooth <- temp_smoothed %>%
+  mutate(date = as.Date(DT_round), hour = lubridate::hour(DT_round) + lubridate::minute(DT_round) / 60) %>%
+  group_by(site, date) %>%
+  slice_max(value_smooth, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(site, date, peak_hour = hour, peak_value = value_smooth)
+
+site_typical_smooth <- temp_peaks_smooth %>%
+  group_by(site) %>%
+  summarise(median_hour = median(peak_hour), .groups = "drop")
+site_typical_smooth
+
+# Find sustained (>= 3 consecutive sampled days) multi-day chunks where the
+# smoothed peak hour deviates by more than 1 hour from that site's typical
+# (median) peak hour
+runs_smooth <- temp_peaks_smooth %>%
+  left_join(site_typical_smooth, by = "site") %>%
+  arrange(site, date) %>%
+  mutate(
+    dev = ((peak_hour - median_hour + 12) %% 24) - 12,
+    dev_bucket = round(dev)
+  ) %>%
+  group_by(site) %>%
+  mutate(
+    gap = as.numeric(date - lag(date)),
+    new_run = is.na(gap) | gap > 3 | dev_bucket != lag(dev_bucket),
+    run_id = cumsum(new_run)
+  ) %>%
+  group_by(site, run_id) %>%
+  summarise(start = min(date), end = max(date), n_days = n(), mean_dev = mean(dev), .groups = "drop") %>%
+  filter(n_days >= 3, abs(mean_dev) > 1) %>%
+  arrange(site, start)
+
+runs_smooth
+```
+
+```{r}
+library(arrow)
+library(tidyverse)
+
+verified_dir <- "~/github/poudre_sonde_network/data/raw/sensor/manual_data_verification/2022_cycle/ip/verified_directory"
+
+verified_files_all <- list.files(verified_dir, pattern = "\\.parquet$", full.names = TRUE)
+
+# Parse site/parameter from each filename (format: "{site}-{parameter}_FINAL_...parquet")
+# and read each file individually, keeping them separate rather than combining
+verified_files_nested <- tibble(file = verified_files_all) %>%
+  mutate(
+    base = basename(file),
+    site = str_extract(base, "^[^-]+"),
+    parameter = str_extract(base, "(?<=-).+(?=_FINAL_)"),
+    data = map(file, ~ read_parquet(.x) %>% as_tibble())
+  ) %>%
+  select(site, parameter, file, data)
+
+# Nest into one row per site, each holding a tibble (one row per file/parameter)
+# of that site's individual file dataframes
+site_nested <- verified_files_nested %>%
+  group_by(site) %>%
+  nest() %>%
+  ungroup()
+
+# Also create one variable per site (e.g. archery_df, bellvue_df, ...) in the
+# global environment, each a tibble of parameter/file/data for that site's files
+site_nested %>%
+  pwalk(function(site, data) {
+    assign(paste0(site, "_df"), data, envir = .GlobalEnv)
+  })
+
+site_nested
+archery_df
+```
+
+```{r}
+library(plotly)
+
+# Build a plotly line plot (value vs. DT_round) for each individual
+# dataframe (i.e. each file: one site/parameter combo)
+make_file_plot <- function(df, site, parameter) {
+  df <- df %>% mutate(value = coalesce(mean_verified, mean))
+  units <- unique(df$units)[1]
+
+  plot_ly(df, x = ~DT_round, y = ~value, type = "scatter", mode = "lines") %>%
+    layout(title = paste(site, parameter, sep = " - "),
+           xaxis = list(title = "Date"),
+           yaxis = list(title = paste0(parameter, " (", units, ")")))
+}
+
+# Add a "plot" list-column (one plotly per file) to each site's nested tibble
+site_nested <- site_nested %>%
+  mutate(data = map2(site, data, function(s, df) {
+    df %>% mutate(plot = map2(data, parameter, ~ make_file_plot(.x, s, .y)))
+  }))
+
+# Re-create the per-site variables (archery_df, bellvue_df, ...) now that
+# each includes the "plot" column
+site_nested %>%
+  pwalk(function(site, data) {
+    assign(paste0(site, "_df"), data, envir = .GlobalEnv)
+  })
+
+# Example: view the plot for one file
+cottonwood_df$plot[[6]]
+```

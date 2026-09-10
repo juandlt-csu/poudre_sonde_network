@@ -1,0 +1,93 @@
+---
+title: "Step 1 — Reconcile Hours & Preview Totals"
+author: "ROSSyndicate - Sam Struthers"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# What this does
+
+Run this **before** you touch `pwqn_budget_reporting.xlsx`. It compares the
+$ amount Symphony billed for each person (entered in `00_config.R`) against
+the hours already logged in the `staff_timeclock` sheet, split across PWQN
+and UCLP. Use it to sanity-check your xlsx entries, then re-run after
+updating the xlsx to confirm everything reconciles before generating reports.
+
+# User inputs required
+
+-   Edit `month_select` / `year_select` and the Symphony $ amounts below
+-   Once a year, update the `hourly_rates` xlsx with the new rates for each person (see `00_config.R`)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+source(here::here("operations/reporting/budget/00_config.R"))
+###### ------ Month/Year SELECTOR ------ ######
+month_select <- 7
+year_select  <- 2026
+###### ------ SYMPHONY 53-ACCOUNT $ AMOUNTS ------ ######
+#    Paste in the $ billed per person (whole project, both PWQN + UCLP combined,
+#    since they share one job code) from Symphony each month.
+hours_billed_raw <- tibble::tribble(
+  ~person,        ~monthly_amount,
+  "STRUTHERS",    0,
+  "DE LA TORRE",  0,
+  "WILLI",        0,
+  "ROUIN",        0,
+  "DUNCAN",       0
+)
+
+###### ------ NON-PERSONNEL (equipment/travel) COSTS, per project------ ######
+#    These usually come straight off the equipment_charges / travel sheets in
+#    the xlsx (see budget_functions::load_equipment()/load_travel()), but if
+#    you need to hand-override a project's totals for the Symphony 53-account
+#    reconciliation step, do it here.
+# (left NULL by default -- 01_check_hours.Rmd will pull these live from the xlsx.
+#  Only set this if you need to override.)
+non_personnel_override <- NULL
+```
+
+```{r load}
+hourly_rates <- load_hourly_rates(rates_file)
+timeclock    <- load_timeclock(reporting_xlsx, month_select, year_select)
+equipment    <- load_equipment(reporting_xlsx, month_select, year_select)
+travel       <- load_travel(reporting_xlsx, month_select, year_select)
+
+reconciled <- reconcile_hours_and_cost(timeclock, hourly_rates, hours_billed_raw)
+```
+
+## 1. Hours: logged (staff_timeclock) vs. implied by $ billed
+
+`remaining_hours` should be close to 0. Positive means added
+more hours than should exist based on Symphony Data; negative means
+you've added more hours than were billed.
+Update the `staff_timeclock` sheet in `pwqn_budget_reporting.xlsx` until this table reconciles.
+
+```{r hours-check}
+reconciled$hours_check
+```
+
+## 2. Dollars: logged (staff hours x rate) vs. Symphony $ billed
+
+```{r cost-check}
+reconciled$cost_check
+sum(reconciled$cost_check$remaining_amount) #Should be close to 0, wiggle room <5 $ is okay
+```
+
+## 3. Final totals per project (personnel + equipment + travel + IDC)
+
+These are the numbers to copy into the expenditure tracker once the two
+tables above reconcile.
+
+```{r final-totals}
+final_totals <- calc_final_totals(timeclock, hourly_rates, equipment, travel, idc_rate)%>%
+  #make a new row which is the totals for each column
+  bind_rows(summarise(., across(where(is.numeric), sum, na.rm = TRUE )))%>%
+  #add a new column to the totals row to identify it as totals
+  mutate(project = if_else(is.na(project), "TOTAL", project))
+
+final_totals # Double check the totals against the Symphony values and Invoicing sheet
+```
+
+
+**Next step:**  update `pwqn_budget_reporting.xlsx` as needed until the tables above look right, re-run this file to confirm, then
+move on to `02_prep_charges_gen_report.Rmd` for each project.

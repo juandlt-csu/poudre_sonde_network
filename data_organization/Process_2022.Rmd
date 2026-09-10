@@ -1,7 +1,7 @@
 ---
-title: "Process 2022"
-author: "Katie Willi"
-date: "2025-12-01"
+title: "PWQN 2022 Data Processing Script"
+author: "Danny Duncan"
+date: "`r Sys.Date()`"
 output: html_document
 ---
 
@@ -9,12 +9,13 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-This is the workflow for organizing old (2022) Poudre Sonde Network data. This data was collected before our current protocol was produced, and therefore requires a slightly different workflow for performing our auto-QAQC pipeline.
+This is the workflow for organizing 2022 Poudre Sonde Network data. This data was collected before our current protocol was produced, and therefore requires a slightly different workflow for performing our auto-QAQC pipeline.
 
 Generally, this year had some pretty low-quality data, as the majority of sensors' life cycles ended all at once.
 
-## 1) Packages & parallel configuration
+## 1) Set-up
 
+### 1.1) Package Load
 ```{r}
 # load required packages
 package_loader <- function(x) {
@@ -49,31 +50,73 @@ invisible(
 # load all required packages
 invisible(
   lapply(c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo", "ggpubr",
-           "padr", "stats", "RcppRoll", "yaml", "here", "furrr", "ross.wq.tools"),
+           "plotly", "padr", "stats", "RcppRoll", "yaml", "here", "furrr", "ross.wq.tools"),
          package_loader)
-)
-
-
-# Configure parallel processing
-max_workers <- 4  # Maximum number of parallel workers
-num_workers <- min(availableCores() - 1, max_workers)
-plan(multisession, workers = num_workers)
-furrr_options(
-  globals = TRUE,
-  packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
-               "padr", "stats", "RcppRoll", "yaml", "here", "ross.wq.tools")
 )
 
 ```
 
-## 2) Thresholds, credentials, and field notes data
-
+### 1.2) Parallel Compute Configuration
 ```{r}
-# Read in the threshold data first
-sensor_thresholds <- read_yaml(here("data","derived","auto_qaqc_files", "thresholds", "sensor_spec_thresholds.yml"))
-season_thresholds <- read_csv(here("data","derived","auto_qaqc_files", "thresholds", "seasonal_thresholds20260304-T175010Z.csv"), show_col_types = FALSE) %>%
-  fix_site_names()
+# Configure parallel processing
+max_workers <- 4  # Maximum number of parallel workers
+num_workers <- min(availableCores() - 1, max_workers)
+plan(multisession, workers = num_workers)
+furrr_ops <- furrr_options(globals = TRUE,
+                           packages = c("arrow", "data.table", "httr2", "tidyverse", "lubridate", "zoo",
+                                        "padr", "stats", "RcppRoll", "yaml", "here", "ross.wq.tools")
+                           )
+```
 
+### 1.3) Directory Configuration
+```{r}
+base_dir <- here("data","raw", "sensor","manual_data_verification","2022_cycle")
+# Make sure base dir exists; create if not
+if (!dir.exists(base_dir)) {
+  dir.create(base_dir)
+}
+
+# Folder with downloaded logs
+log_dir <- here("data","raw", "sensor", "log_download", "2022")
+decon_log_dir <- here(log_dir, "deconflict_logs")
+
+#Sub folders for raw and flagged data
+staging_dir <- here(base_dir,"hydro_vu_pull" ,"raw_data")
+flagged_temp_dir <- here(base_dir,"hydro_vu_pull" ,"flagged_data_temp")
+flagged_dir <- here(base_dir,"hydro_vu_pull" ,"flagged_data")
+
+all_path = here(base_dir,"in_progress","all_data_directory")
+pre_verification_path = here(base_dir, "in_progress","pre_verification_directory")
+intermediary_path = here(base_dir, "in_progress","intermediary_directory")
+verified_path = here(base_dir, "in_progress","verified_directory")
+raw_data_path = here(base_dir, "in_progress","raw_data")
+meta_folder_path = here(base_dir, "in_progress","meta")
+
+#check to make sure these all exist and create if needed
+dir_paths <- c(staging_dir, flagged_temp_dir, flagged_dir, all_path, 
+               pre_verification_path, intermediary_path, verified_path, raw_data_path)
+walk(dir_paths, ~ if (!dir.exists(.x)) dir.create(.x, recursive = TRUE))
+# The meta folder and associated files are necessary to run future ShinyApps
+if (!dir.exists(meta_folder_path)) {
+  dir.create(meta_folder_path)
+  # Save copies of meta files to 2022_cycle
+  # Site order file
+  file.copy(from = here("data", "derived", "auto_qaqc_files", "site_order", "site_order_pre2023.yml"), 
+            to = meta_folder_path)
+  # Seasonal threshold file
+  file.copy(from = here("data","derived","auto_qaqc_files", "thresholds","seasonal_thresholds20260304-T175010Z.csv"), 
+            to = here(meta_folder_path,"seasonal_thresholds.csv"))
+  # Available flags file
+  file.copy(from = here("data","raw","sensor", "manual_data_verification","2025_cycle", "in_progress", "meta",   "available_flags.csv"), to = meta_folder_path)
+  # Parameter auto selections file
+  file.copy(from = here("data","raw","sensor", "manual_data_verification","2025_cycle", "in_progress", "meta",   "parameter_autoselections.csv"), to = meta_folder_path)
+  }
+```
+
+## 2) Credentials, Thresholds, Field Notes
+
+### 2.1) Credentials
+```{r}
 # Configure your credentials files
 mwater_creds_file <- here("creds","mWaterCreds.yml")
 mWater_creds <- read_yaml(mwater_creds_file)
@@ -85,487 +128,401 @@ mWater_data <- load_mWater(creds = mWater_creds)
 sensor_malfunction_notes <- grab_mWater_malfunction_notes(mWater_api_data = mWater_data) %>%
   mutate(start_DT = with_tz(start_DT, tzone = "UTC"),
          end_DT = with_tz(end_DT, tzone = "UTC"))
+
 ```
 
-#### Pulling in field notes
-
+### 2.2) Thresholds
 ```{r}
-all_field_notes <- readxl::read_excel(here("data","raw","field_notes","sensor_field_notes.xlsx")) %>%
-  mutate(DT = (paste0(date, " ", start_time_mst))) %>%
-  mutate(DT = ymd_hm(DT) + hours(7)) %>%
-  arrange(DT) %>%
-  mutate(DT_round = round_date(DT, "15 minutes")) %>%
-  mutate(DT_round = with_tz(DT_round, tzone = "UTC"),
-         last_site_visit = with_tz(DT_round, tzone = "UTC"),
-         DT_join = as.character(DT_round),
-         sonde_moved = NA,
-         sonde_employed = case_when(is.na(sensor_deployed) & is.na(sensor_pulled) ~ NA,
-                                    sensor_deployed == "x" ~ 0, 
-                                    sensor_pulled == "x" ~ 1), 
-         site = ifelse(site == "rist", "bellvue", site)) %>%
-  ross.wq.tools::fix_site_names()%>%
-  #add extra cols
-  mutate(rdo_pre_clean = NA, 
-         rdo_post_clean = NA,
-         rdo_post_cal = NA,
-         cond_pre_clean = NA,
-         cond_post_clean = NA,
-         cond_post_cal = NA,
-         ph_pre_clean = NA,
-         ph_post_clean = NA,
-         ph_post_cal = NA,
-         orp_pre_clean = NA,
-         orp_post_clean = NA,
-         orp_post_cal = NA,
-         turb_pre_clean = NA,
-         turb_post_clean = NA,
-         turb_post_cal = NA,
-         fdom_pre_clean = NA,
-         fdom_post_clean = NA,
-         fdom_post_cal = NA,
-         chla_pre_clean = NA,
-         chla_post_clean = NA,
-         chla_post_cal = NA)
+# Read in the threshold data first
+sensor_thresholds <- read_yaml(here("data","derived","auto_qaqc_files", "thresholds", "sensor_spec_thresholds.yml"))
+season_thresholds <- read_csv(here("data","derived","auto_qaqc_files", "thresholds", "seasonal_thresholds20260304-T175010Z.csv"), show_col_types = FALSE) %>%
+  fix_site_names()
 ```
 
-## 3) Ingest & standardize raw data
-
-**Ingest data from each site:**
-
-### Rist
-
-Sometime before 2022-05-06, flows dropped below the sensors, so we "capped" the sonde until flows were consistently high enough. This site was damaged during peak flows and we were unable to re-install it. This is why we moved the sonde a few hundred yards downstream in CSU's Tamasag Retreat Center in 2023.
-
+### 2.3) Field Notes
 ```{r}
-# OG time in UTC
-rist_final <- list.files(here::here("data", "raw", "sensor", "log_download", "2022", "rist"), full.names = TRUE, recursive = TRUE) %>%
-  purrr::map_dfr(~ xml2::read_html(.x) %>% ross.wq.tools::parse_insitu_html_log()) %>%
-  # Convert to MST for linking with old field notes
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) - lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) - lubridate::hours(7)) %>%
-  # Sensor pulled 2022-05-30 after sensor housing destroyed
-  dplyr::filter(lubridate::ymd_hms(DT_round) <= lubridate::ymd_hms("2022-05-30 09:00:00")) %>%
-  # Sensor also capped from 5/6/2022 - 5/9/2022 (flow too low)
-  dplyr::filter(!(lubridate::ymd_hms(DT_round) >= lubridate::ymd_hms('2022-05-06 12:00:00') & lubridate::ymd_hms(DT) <= lubridate::ymd_hms('2022-05-09 14:30:00'))) %>%
-  # Convert back to UTC
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) + lubridate::hours(7)) %>%
-  dplyr::group_by(parameter) %>%
-  dplyr::arrange(lubridate::ymd_hms(DT)) %>%
-  dplyr::mutate(site = "rist",
-                id = "rist",
-                name = "rist") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
-  dplyr::ungroup() %>%
-  dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
-
-ggplot(data = rist_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+# Read-in historical field notes (2021-2022) and filter for 2022
+field_notes <- read_parquet(here(meta_folder_path, "field_notes_21-22.parquet")) %>% 
+  filter(date >= as.Date("2022-01-01"))
 ```
 
-### Legacy
+## 3) Raw Data Ingest & Standardization
 
-So far in 2022, all data has been sent to HydroVu outside of genomic sampling on 2022-09-19. This location encountered several issues this field season: sensor pulled 2022-05-24 due to fears that its infrastructure would wash away. Sensor was re-deployed 2022-06-01, but was then pulled out due to sensor issues 2022-07-08 (turbidity problems, conductivity problems). Sometime between then and 2022-07-12, turbidity sensor totally broke. 2022-07-16, the turbidity sensor was replaced with the one that was previously being used at Archery. Between 2022-07-18 and 2022-07-21, the back-up sensor stopped working. After this we we swapped the sonde with the sensor from Rist (2022-08-03). On 2022-08-04, the sensor was pulled because flows were too low (sensor was likely not suspended in the water 8/3 - 8/4). Redeployed on 2022-08-25, though issues with turbidity and ORP occurred from then until we pulled it 2022-09-07.
+### 3.1) Ingest Data
+
+#### 3.1.1) Rist (Bellvue)
+
+- Start: 2022-04-22
+- End: 2022-05-24
+- Notes: 
+  - Sensor “capped” during low flow period. Damaged during peak flows and not re-installed during 2022.
+  - Sonde housing destroyed sometime before 2022-05-24
 
 ```{r}
-# No VuLink connection during final genomic survey (water was too low for full deployment). OG Time in MDT.
-genomic_survey <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "legacy", "manual"), full.names = T), pattern = "trolled", invert = FALSE, value = TRUE) %>%
-  xml2::read_html() %>%
+# OG timezone in UTC
+bellvue_final <- xml2::read_html(here::here(decon_log_dir, "bellvue_all_2022.htm")) %>%
   ross.wq.tools::parse_insitu_html_log() %>%
-  # Convert to UTC
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6))
-
-# Full Dataset. OG Time in MST.
-legacy_final <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "legacy"), full.names = TRUE), pattern = "manual", invert = TRUE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(lubridate::year(DT) == 2022) %>%
-  # Data stored in UTC... convert to MST to link with field note times...
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) - lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) - lubridate::hours(7)) %>%
-  # Remove data ranges where sensor was pulled out of field (THAT I KNOW OF, IE 2022 ONLY)
-  dplyr::filter(!((DT_round) >= ('2021-12-04 19:30:00') & (DT_round) < ('2022-04-06 17:30:00')),
-                !((DT_round) >= ('2022-05-24 09:30:00') & (DT_round) < ('2022-06-01 13:30:00')),
-                !((DT_round) > ('2022-07-08 14:00:00') & (DT_round) <= ('2022-07-12 10:00:00')),
-                !((DT_round) >= ('2022-08-04 09:50:00') & (DT_round) <= ('2022-08-25 16:15:00')),
-                !((DT_round) > ('2022-09-07 06:57:00') & (DT_round) <= ('2022-09-18 07:00:00'))) %>%
-  # Convert back to UTC
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) + lubridate::hours(7)) %>%
-  dplyr::bind_rows(genomic_survey) %>%
-  dplyr::mutate(site = "legacy",
-                id = "legacy",
-                name = "legacy") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
+  # Sensor pulled 2022-05-30 after sensor housing destroyed
+  dplyr::filter(DT_round <= ymd("2022-05-25")) %>%
+  # Sensor also capped from 5/6/2022 - 5/9/2022 (flow too low) (timezone in UTC)
+  dplyr::filter(!(DT_round >= ymd_hms('2022-05-06 18:00:00') & DT_round <= ymd_hms('2022-05-09 20:30:00'))) %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "bellvue",
+                id = "bellvue",
+                name = "bellvue") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
   dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
+  dplyr::filter(!is.na(DT))
 
-ggplot(data = legacy_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+ggplot(data = bellvue_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### Lincoln
+#### 3.1.2) Legacy (Salyer)
 
-Lincoln was the newest site and was run by In-Situ. We have access to this site on HydroVu but the site's VuLink wasn't sending data. In-Situ sent us an excel spreadsheet of the data mid-season and not again.
+- Start: 2022-04-07
+- End: 2022-09-19
+- Notes:
+    - 2022-05-24: Pulled due to questionable housing integrity
+    - 2022-06-01: Redeployed
+    - 2022-07-08: Pulled (turbidity & conductivity problems)
+    - Between 2022-07-08 & 2022-07-12: turbidity sensor completely breaks; replaced with sensor previously used at archery
+    - Between 2022-07-18 & 2022-07-21: back-up sensor stopped working
+    - 2022-08-03: Sonde swapped w/ rist
+    - 2022-08-03/2022-08-04: Sensor suspended out of water
+    - 2022-08-04: Sonde pulled due to low flows
+    - 2022-08-25: Redeployed; continued turbidity & ORP issues until end of season
+    
+```{r}
+# Legacy; UTC tz
+salyer_1 <- xml2::read_html(here(decon_log_dir, "salyer_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+salyer_2 <- xml2::read_html(here(decon_log_dir, "salyer_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
+
+salyer_final <- dplyr::bind_rows(salyer_1, salyer_2) %>% 
+  # Remove data ranges where sensor was pulled out of field based on notes (UTC Time)
+  dplyr::filter(!((DT_round) >= ('2022-05-24 15:30:00') & (DT_round) < ('2022-06-01 19:30:00')),
+              !((DT_round) > ('2022-07-08 20:00:00') & (DT_round) <= ('2022-07-12 16:00:00')),
+              !((DT_round) >= ('2022-08-04 15:50:00') & (DT_round) <= ('2022-08-25 22:15:00'))) %>%
+  dplyr::mutate(site = "salyer",
+                id = "salyer",
+                name = "salyer") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%  dplyr::filter(!is.na(value)) %>%
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
+
+ggplot(data = salyer_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
+```
+
+#### 3.1.3) Lincoln (Udall)
+
+- Start: 2022-03-24
+- End: 2022-07-22
+- Notes:
+    - Site ran by in-situ
+    - Excel of data sent mid season and not again until end of season, so data is pretty spotty.
 
 ```{r}
-# OG in MDT.
-raw <- readxl::read_excel(here::here("data", "raw", "sensor", "log_download", "2022", "lincoln", "lincoln.xlsx"))
+# OG in UTC even though vu-situ file states -6hr offset from UTC (validated with water temperature)
+udall_raw <- readxl::read_excel(here::here(decon_log_dir, "lincoln_all_2022.xlsx"))
 
-names(raw) <- make.names(names(raw), unique = T)
-
-lincoln_final <- raw %>%
-  dplyr::select(DT_instrument = tidyr::contains('Date.Time'),
-                Water_Temp_C = as.numeric(contains('Temperature')),
-                pH = tidyr::contains('pH'),
-                ORP_mV = tidyr::contains('ORP'),
-                Specific_Conductivity_µS_cm = tidyr::contains('Specific.Conductivity..µS.cm.'),
-                DO_ppm = tidyr::contains('RDO.Conc'),
-                Turbidity_NTU = tidyr::contains('Turbidity'),
-                Depth_ft = tidyr::contains('Depth')) %>%
-  dplyr::mutate_at(vars(2:ncol(.)), as.numeric) %>%
-  tidyr::pivot_longer(-DT_instrument, names_to = "var", values_to = "value") %>%
+udall_final <- udall_raw %>%
+  dplyr::mutate(DT_round = lubridate::round_date(DT, "15 minutes")) %>%
+  tidyr::pivot_longer(-c("DT", "DT_round"), names_to = "parameter", values_to = "value") %>%
   dplyr::mutate(value = as.numeric(value),
-                parameter = dplyr::case_when(var == "Water_Temp_C" ~ "Temperature",
-                                             var == "pH1" ~ "pH",
-                                             var == "ORP_mV" ~ "ORP",
-                                             var == "Specific_Conductivity_µS_cm" ~ "Specific Conductivity",
-                                             var == "DO_ppm" ~ "DO",
-                                             var == "Depth_ft" ~ "Depth",
-                                             var ==  "Turbidity_NTU" ~ "Turbidity"),
-                # Original units
-                original_unit = dplyr::case_when(var == "Water_Temp_C" ~ "C",
-                                                 var == "pH1" ~ "pH",
-                                                 var == "ORP_mV" ~ "mV",
-                                                 var == "Depth_ft" ~ "ft",
-                                                 var == "Specific_Conductivity_µS_cm" ~ "µS/cm",
-                                                 var == "DO_ppm" ~ "ppm",
-                                                 var == "Turbidity_NTU" ~ "NTU"),
                 # Target units
-                units = dplyr::case_when(var == "Water_Temp_C" ~ "C",
-                                         var == "pH1" ~ "pH",
-                                         var == "ORP_mV" ~ "V",
-                                         var == "Depth_ft" ~ "m",
-                                         var == "Specific_Conductivity_µS_cm" ~ "µS/cm",
-                                         var == "DO_ppm" ~ "mg/L",
-                                         var == "Turbidity_NTU" ~ "NTU"),
+                units = dplyr::case_when(parameter == "Temperature" ~ "C",
+                                         parameter == "pH" ~ "pH",
+                                         parameter == "ORP" ~ "V",
+                                         parameter == "Depth" ~ "m",
+                                         parameter == "Specific Conductivity" ~ "µS/cm",
+                                         parameter == "DO" ~ "mg/L",
+                                         parameter == "Turbidity" ~ "NTU"),
                 # Convert values to new units
-                value = dplyr::case_when(var == "DO_ppm" ~ value, # ppm is equivalent to mg/L for dissolved oxygen 
-                                         var == "Depth_ft" ~ value * 0.3048, # feet to meters
-                                         var == "ORP_mV" ~ value / 1000, # millivolts to volts
+                value = dplyr::case_when(parameter == "DO" ~ value, # ppm is equivalent to mg/L for dissolved oxygen
+                                         parameter == "Depth" ~ value * 0.3048, # feet to meters
+                                         parameter == "ORP" ~ value / 1000, # millivolts to volts
                                          TRUE ~ value),
-                site = "lincoln",
-                id = "lincoln",
-                name = "lincoln") %>%
-  # MDT to UTC
-  dplyr::mutate(DT_instrument =  lubridate::ymd_hms(DT_instrument) +  lubridate::hours(6)) %>%
-  dplyr::select(site, id, name, timestamp = DT_instrument, parameter, value, units) %>%
-  dplyr::ungroup() %>%
+                # Fix site/id/name from lincoln to udall
+                site = "udall",
+                id = "udall",
+                name = "udall"
+                ) %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units) %>%
   dplyr::filter(!is.na(value)) %>%
   dplyr::filter(!is.na(parameter)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)%>%
-  pivot_wider(id_cols = c(site, id, name, timestamp),
-              names_from = parameter, values_from = value)%>%
-  filter( !(is.na(pH) & Temperature <= 0))%>%
-  pivot_longer( cols = any_of(c("Temperature", "Depth", "Specific Conductivity", "DO", "pH", "Turbidity", "ORP")),
-                names_to = "parameter",values_to = "value")
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
 
-ggplot(data = lincoln_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+ggplot(data = udall_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### Timberline
+#### 3.1.4) Timberline (Riverbend)
+
+- Start: 2022-04-06
+- End: 2022-11-15
+- Notes:
 
 ```{r}
-# OG data in UTC
-timberline_final <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "timberline"), full.names = TRUE), pattern = "manual", invert = TRUE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(lubridate::year(DT) == 2022) %>%
-  # Data stored in UTC... convert to MST to link with field note times...
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) - lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) - lubridate::hours(7)) %>%
-  dplyr::filter(!(ymd_hms(DT_round) > ymd_hms('2022-01-01 08:15:00') & ymd_hms(DT_round) <= ymd_hms('2022-04-06 08:15:00'))) %>%
-  # reconvert to UTC...
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) + lubridate::hours(7)) %>%
-  dplyr::mutate(site = "timberline",
-                id = "timberline",
-                name = "timberline") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
+# Timberline; UTC
+riverbend_final <- xml2::read_html(here(decon_log_dir, "riverbend_all_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "riverbend",
+                id = "riverbend",
+                name = "riverbend") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
   dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
+  dplyr::filter(!is.na(DT))
 
-ggplot(data = timberline_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+ggplot(data = riverbend_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### Prospect
+#### 3.1.5) Prospect (Cottonwood)
+
+- Start: 2022-04-30
+- End: 2022-11-15
+- Notes:
 
 ```{r}
-# OG data in UTC.
-prospect_final <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "prospect"), full.names = TRUE), pattern = "manual", invert = TRUE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(lubridate::year(DT) == 2022) %>%
-  dplyr::mutate(site = "prospect",
-                id = "prospect",
-                name = "prospect") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
+# Prospect; UTC
+cottonwood_final <- xml2::read_html(here(decon_log_dir, "cottonwood_all_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::arrange(DT) %>%
+  dplyr::mutate(site = "cottonwood",
+                id = "cottonwood",
+                name = "cottonwood") %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
+  dplyr::ungroup() %>%
   dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
-
-ggplot(data = prospect_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+  dplyr::filter(!is.na(DT))
+  
+ggplot(data = cottonwood_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### ELC
+#### 3.1.6) Boxelder (ELC)
 
-Deployed for a brief period of time in the spring (site became unsuitable) until end of May. Brief manual stint for genomic survey in June. In July, we moved it a few hundred yards downstream to the Boxelder WWTP.
+- Start: 2022-04-23
+- End: 2022-11-15
+- Notes:
+    - 2022-05-26: Pulled due to unsuitable site (elc_1_2022.htm & elc_2_2022.htm contains data from this deployment in -6hr UTC offset)
+    - 2022-07-27: Re-deployed near boxelder WWTP outfall; continued issues with turbidity and ORP until end of season (elc_3_2022.htm contains data from this deployment in UTC)
 
 ```{r}
-# OG in MDT:
-elc_spring <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "elc", "manual"), full.names = TRUE), pattern = "trolled", invert = FALSE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(lubridate::month(DT) < 7) %>%
-  # MDT to UTC
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6)) %>%
-  dplyr::filter(!is.na(value))
+elc_1 <- xml2::read_html(here(decon_log_dir, "elc_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6))
 
-# OG UTC
-elc_at_boxelder <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "elc"), full.names = TRUE), pattern = "Boxelder", invert = FALSE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(!is.na(value))
+elc_2 <- xml2::read_html(here(decon_log_dir, "elc_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log() %>%
+  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(6))
 
-# OG UTC
-elc_replacement <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "elc"), full.names = TRUE), pattern = "Rist", invert = FALSE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::filter(lubridate::month(DT) >= 9) %>%
-  dplyr::filter(!is.na(value))
+elc_3 <- xml2::read_html(here(decon_log_dir, "elc_3_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
 
-elc_final <- elc_spring %>%
-  dplyr::bind_rows(elc_at_boxelder) %>%
-  dplyr::bind_rows(elc_replacement) %>%
+elc_final <- elc_1 %>%
+  dplyr::bind_rows(elc_2) %>%
+  dplyr::bind_rows(elc_3) %>%
   dplyr::mutate(site = "elc",
                 id = "elc",
-                name = "elc") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
+                name = "elc",
+                unit = if_else(parameter == "Temperature", "C", unit)) %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
   dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
 
-
+ggplot(data = elc_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### Archery
+#### 3.1.7) Archery
 
-Sonde encountered issues (temperature, chl-a, conductivity) early in the season so we swapped the sensor out for our back-up (intended for Fossil Creek). Then, it got buried at some point between 7/1 and 7/6 and got unclogged 7/14. Otherwise no issues encountered. 10/4-10/7 sensor capped (new technician had issues connecting and didn't know what to do).
+- Start: 2022-04-06
+- End: 2022-11-15
+- Notes:
+    - Swapped w/ back-up sensor (Fossil Creek) due to early season issues with Chl-a, temp, cond.
+    - Between 2022-07-01 & 2022-07-06: Burried
+    - 2022-07-14: Unclogged
+    - 2022-10-04 & 2022-10-07: Sensor capped
 
 ```{r}
 #OG data in UTC.
-# parse_insitu_html() doesn't pick up the Chl-a, for some reason... so, need to grab outside that function here...
-archery_chla <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "archery"), full.names = TRUE), pattern = "TROLL", invert = FALSE, value = TRUE) %>%
-  map_dfr(~rvest::read_html(.) %>%
-            rvest::html_node('table') %>%
-            rvest::html_table() %>%
-            dplyr::slice(-1:-8) %>%
-            janitor::row_to_names(row_number = 1) %>%
-            select(DT = `Date Time`, value = `Chl-a Fluorescence (RFU)`) %>%
-            mutate(DT = ymd_hms(DT),
-                   DT_round = round_date(DT, "15 minutes"),
-                   unit = "RFU",
-                   parameter = "Chl-a Fluorescence",
-                   value = as.numeric(value)) %>%
-            filter(!is.na(value)))
+archery_1 <- xml2::read_html(here(decon_log_dir, "archery_1_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
 
+archery_2 <- xml2::read_html(here(decon_log_dir, "archery_2_2022.htm")) %>%
+  ross.wq.tools::parse_insitu_html_log()
 
-# OG data in UTC
-archery_final <- grep(list.files(here::here("data", "raw", "sensor", "log_download", "2022", "archery"), full.names = TRUE), pattern = "TROLL", invert = FALSE, value = TRUE) %>%
-  purrr::map_dfr(~xml2::read_html(.x) %>%
-                   ross.wq.tools::parse_insitu_html_log()) %>%
-  dplyr::bind_rows(archery_chla) %>%
-  # Data stored in UTC... convert to MST to link with field note times...
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) - lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) - lubridate::hours(7)) %>%
-  dplyr::filter(!(ymd_hms(DT_round) > ymd_hms('2022-10-04 15:00:00') & ymd_hms(DT_round) <= ymd_hms('2022-10-07 16:00:00'))) %>%
-  # reconvert to UTC...
-  dplyr::mutate(DT = lubridate::ymd_hms(DT) + lubridate::hours(7),
-                DT_round = lubridate::ymd_hms(DT_round) + lubridate::hours(7)) %>%
+archery_final <- dplyr::bind_rows(archery_1, archery_2) %>% 
+  dplyr::filter(!((DT_round) >= ('2022-10-04 21:00:00') & (DT_round) < ('2022-10-07 00:00:00'))) %>%
   dplyr::mutate(site = "archery",
                 id = "archery",
                 name = "archery") %>%
-  dplyr::select(site, id, name, timestamp = DT, parameter, value, units = unit) %>%
+  dplyr::select(site, id, name, DT, DT_round, parameter, value, units = unit) %>%
   dplyr::filter(!is.na(value)) %>%
-  dplyr::filter(!is.na(timestamp)) %>%
-  dplyr::arrange(timestamp)
+  dplyr::filter(!is.na(DT)) %>%
+  dplyr::arrange(DT)
 
-ggplot(data = archery_final) + geom_point(aes(x = timestamp, y = value)) + facet_wrap(~parameter, scales = "free_y")
+ggplot(data = archery_final) + geom_point(aes(x = DT, y = value)) + facet_wrap(~parameter, scales = "free_y")
 ```
 
-### Complete dataset
+### 3.2) Standardize Data
 
-Uses the following **standardization rules**:
-
--   Long format by variable
-
--   Mapped old variable names → canonical `parameter` and `units`
-
--   Converted units (ft→m, mV→V, DO ppm→mg/L)
-
--   Common columns: `site`, `id`, `name`, `timestamp`, `parameter`, `value`, `units`
-
+#### 3.2.1) Combine Site Data
+ 
 ```{r}
-all_sites <- bind_rows(rist_final, legacy_final, lincoln_final, timberline_final, 
-                       prospect_final, elc_final, archery_final)
+all_sites <- bind_rows(bellvue_final, salyer_final, udall_final, riverbend_final, 
+                       cottonwood_final, elc_final, archery_final)
 ```
 
-#### Fixing depth mis-calibrations:
+#### 3.2.2) Depth Mis-calibration Correction
 
 ```{r}
-# Legacy depth corrections
-legacy_depth_corrected <- all_sites %>%
+# Salyer depth corrections
+salyer_depth_corrected <- all_sites %>%
     filter(parameter == "Depth",
-         site == "legacy") %>%
-  # Data stored in UTC... convert to MST to link with field note times...
-  dplyr::mutate(timestamp = timestamp - lubridate::hours(7)) %>%
+           site == "salyer") %>%  
+  # UTC to MST conversion to link with field notes
+  mutate(DT = with_tz(DT, tzone = "MST")) %>%
   # First correction: 2022-04-06 to 2022-04-12
-  mutate(value_p1 = ifelse(timestamp >= ymd_hms('2022-04-06 06:00:00') & timestamp < ymd_hms('2022-04-12 9:20:00'), 
-                           value + 
-                             abs(
-                               filter(., timestamp == ymd_hms('2022-04-12 09:15:00'))$value - 
-                                 filter(., timestamp == ymd_hms('2022-04-12 16:30:00'))$value
-                             ), 
-                           value))
-
-legacy_depth_corrected <- legacy_depth_corrected %>%
+  mutate(value_p1 = ifelse(DT >= ymd_hms('2022-04-06 06:00:00', tz = 'MST') & DT < ymd_hms('2022-04-12 9:20:00', tz = 'MST'), 
+                           value + abs(filter(., DT == ymd_hms('2022-04-12 09:15:00', tz = "MST"))$value 
+                                       - filter(., DT == ymd_hms('2022-04-12 16:30:00', tz = "MST"))$value), 
+                           value)
+         ) %>%
   # Second correction: 2022-07-22 to 2022-07-25
   #timestamp > ymd_hms('2022-07-22 16:45:00') & timestamp < ymd_hms('2022-07-25 21:29:00')
-  mutate(value_p2 = ifelse(timestamp > ymd_hms('2022-07-22 09:45:00') & timestamp < ymd_hms('2022-07-25 14:29:00'), 
-                           value_p1 + 
-                             abs(
-                               filter(legacy_depth_corrected, timestamp == ymd_hms('2022-07-25 14:15:00'))$value_p1 -
-                                 filter(legacy_depth_corrected, timestamp == ymd_hms('2022-07-25 14:29:00'))$value_p1
-                             ), 
-                           value_p1)) %>%
+  mutate(value_p2 = ifelse(DT > ymd_hms('2022-07-22 09:45:00', tz = 'MST') & DT < ymd_hms('2022-07-25 14:29:00', tz = 'MST'), 
+                           value_p1 + abs(filter(., DT == ymd_hms('2022-07-25 14:15:00', tz = "MST"))$value_p1 
+                                          - filter(., DT == ymd_hms('2022-07-25 14:29:00', tz = "MST"))$value_p1), 
+                           value_p1)
+         ) %>%
   mutate(value = value_p2) %>%
-  select(-value_p1, -value_p2) %>%
-  # Data stored in UTC... convert back...
-  dplyr::mutate(timestamp = lubridate::ymd_hms(timestamp) + lubridate::hours(7)) 
+  select(-value_p1, 
+         -value_p2) %>%
+  # Convert timestamp back to UTC
+  mutate(DT = with_tz(DT, tzone = "UTC"))
 
-# Timberline depth corrections
+```
+
+```{r}
+# Riverbend depth corrections
 # weird mis-calibration
-timberline_depth_corrected <- all_sites %>%
+riverbend_depth_corrected <- all_sites %>%
   filter(parameter == "Depth",
-         site == "timberline") %>%
-  # Data stored in UTC... convert to MST to link with field note times...
-  dplyr::mutate(timestamp = lubridate::ymd_hms(timestamp) - lubridate::hours(7)) %>%
+         site == "riverbend") %>%
+  # UTC to MST conversion to link with field notes
+  mutate(DT = with_tz(DT, tzone = "MST")) %>%
   # First correction: 2022-04-06 to 2022-04-07
-  mutate(value_p1 = ifelse(timestamp >= ymd_hms('2022-04-06 07:00:00') & timestamp < ymd_hms('2022-04-07 16:56:00'), 
-                           value + 
-                             abs(
-                               filter(., timestamp == ymd_hms('2022-04-07 16:15:00'))$value - 
-                                 filter(., timestamp == ymd_hms('2022-04-07 17:15:00'))$value
-                             ), 
-                           value)) 
- 
-# purposefully shifted sonde up in housing:
- timberline_depth_corrected <- timberline_depth_corrected %>%
-   # Second correction: after 2022-09-14
-   mutate(value_p2 = ifelse(timestamp >= ymd_hms('2022-09-14 13:15:00'), 
-                            value_p1 +
-                              abs(
-                                filter(timberline_depth_corrected, timestamp == ymd_hms('2022-09-14 13:00:00'))$value_p1 -
-                                  filter(timberline_depth_corrected, timestamp == ymd_hms('2022-09-14 13:15:00'))$value_p1
-                              ), 
-                            value_p1)) %>%
-   mutate(value = value_p1) %>%
-   select(-value_p1) %>%
-  # Data stored in UTC... so convert back to UTC...
-  dplyr::mutate(timestamp = lubridate::ymd_hms(timestamp) + lubridate::hours(7)) 
+  mutate(value_p1 = ifelse(DT >= ymd_hms('2022-04-06 07:00:00', tz = 'MST') & DT < ymd_hms('2022-04-07 16:56:00', tz = 'MST'), 
+                           value + abs(filter(., DT == ymd_hms('2022-04-07 16:15:00', tz = 'MST'))$value 
+                                       - filter(., DT == ymd_hms('2022-04-07 17:15:00', tz = 'MST'))$value), 
+                           value)
+         ) %>% 
+  # purposefully shifted sonde up in housing:
+  # Second correction: after 2022-09-14
+  mutate(value_p2 = ifelse(DT >= ymd_hms('2022-09-14 13:15:00', tz = 'MST'), 
+                           value_p1 + abs(filter(., DT == ymd_hms('2022-09-14 13:00:00', tz = "MST"))$value_p1 
+                                          - filter(., DT == ymd_hms('2022-09-14 13:15:00', tz = "MST"))$value_p1),
+                           value_p1)
+         ) %>%
+  mutate(value = value_p2) %>%
+  select(-value_p1,
+         -value_p2) %>%
+  # Convert timestamp back to UTC
+  mutate(DT = with_tz(DT, tzone = "UTC"))
 
+```
+
+```{r}
 # combine corrected depths with original data
 all_sites_corrected <- all_sites %>%
-  filter(!(parameter == "Depth" & site == "legacy")) %>%
-  filter(!(parameter == "Depth" & site == "timberline")) %>%
-  bind_rows(legacy_depth_corrected, timberline_depth_corrected) %>%
-  fix_site_names() %>%
-  arrange(site, timestamp, parameter)
+  filter(!(parameter == "Depth" & site == "salyer")) %>%
+  filter(!(parameter == "Depth" & site == "riverbend")) %>%
+  bind_rows(salyer_depth_corrected, riverbend_depth_corrected) %>%
+  arrange(site, DT, parameter)
 ```
 
 ```{r}
+# Red indicates the complete corrected depth time series
+# Black indicates the original depth mis-calibrations
 plotly::ggplotly(ggplot() +
-  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("legacy")), aes(x = timestamp, y = value), color = "black")+
-  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("salyer")), aes(x = timestamp, y = value),linetype = "solid", color = "red"))
+  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("salyer")), aes(x = DT, y = value), color = "black")+
+  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("salyer")), aes(x = DT, y = value),linetype = "solid", color = "red"))
 
 plotly::ggplotly(ggplot() +
-  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("timberline")), aes(x = timestamp, y = value), color = "black")+
-  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("riverbend")), aes(x = timestamp, y = value),linetype = "solid", color = "red"))
+  geom_line(data = all_sites %>% filter(parameter == "Depth" & site %in% c("riverbend")), aes(x = DT, y = value), color = "black")+
+  geom_line(data = all_sites_corrected %>% filter(parameter == "Depth" & site %in% c("riverbend")), aes(x = DT, y = value),linetype = "solid", color = "red"))
 ```
 
-## 4) Save site-year raw data (Parquet)
+## 4) Save Raw Data
 
+### 4.1) Split by Site & Year
 ```{r}
-# # Split by site and year
 raw_data_site_year <- all_sites_corrected %>%
   distinct(.keep_all = TRUE) %>%
-  mutate(year = year(timestamp)) %>%
+  mutate(year = year(DT)) %>%
   split(f = list(.$site, .$year), sep = "_", drop = TRUE)
+```
 
+### 4.2) Save as Parquet
+```{r}
 # Save files
 iwalk(raw_data_site_year, ~ {
-  latest_ts <- format(max(.x$timestamp, na.rm = TRUE), "%Y-%m-%d_%H%M")
+  latest_ts <- format(max(.x$DT, na.rm = TRUE), "%Y-%m-%d_%H%M")
   site_name <- str_split(.y, "_")[[1]][1]  # Extract just the site name (first part)
-  data_dir <- here("data", "raw", "sensor", "manual_data_verification", paste0(year(latest_ts), "_cycle"), "hydro_vu_pull", "raw")
+  data_dir <- here(staging_dir)
   if (!dir.exists(data_dir)) {
     dir.create(data_dir, recursive = TRUE)
   }  
-  filename <- here("data", "raw", "sensor", "manual_data_verification", 
-                   paste0( year(latest_ts), "_cycle"), "hydro_vu_pull", "raw", paste0(tolower(site_name), "_", latest_ts, ".parquet"))
+  filename <- here(staging_dir, paste0(tolower(site_name), "_", latest_ts, ".parquet"))
   .x %>% select(-year) %>% write_parquet(filename)
   cat("Saved:", filename, "\n")
 })
 ```
 
-## 5) Tidy, join field notes, summarize
+## 5) Tidy, Join, & Summarize
 
-There are, in fact, no field notes during this time frame. But we are running the data through the add_field_notes function to ensure all columns etc. are preserved for future QAQC steps.
-
+### 5.1) Tidy Raw Data
 ```{r}
 # tidy raw data (default 15-minute intervals)
 tidy_data <-  raw_data_site_year %>%
   bind_rows() %>%
-  mutate(DT_round = round_date(timestamp, "15 minutes")) %>%
   mutate(DT_join = as.character(paste(DT_round))) %>%
   ross.wq.tools::fix_site_names(., site_col = "site") %>%
   select(DT_round, DT_join, site, parameter, value, units) %>%
-  mutate(site = ifelse(site == "rist", "bellvue", site)) %>%
   distinct(.keep_all = TRUE) %>%
   modify_if(., is.numeric, ~ ifelse(is.nan(.x) | is.infinite(.x), NA, .x)) %>%
   split(f = list(.$site, .$parameter), sep = "-") %>%
   keep(~nrow(.) > 0) %>%
   future_map(~tidy_api_data(api_data = .), .progress = TRUE) %>%
   keep(~!is.null(.))
+```
 
-# add field notes to tidied data (there aren't any for these years)
+### 5.2) Join with Field Notes
+```{r}
 combined_data <- tidy_data %>%
-  future_map(~add_field_notes(df = ., notes = all_field_notes), .progress = TRUE)
+  future_map(~add_field_notes(df = ., notes = field_notes), .progress = TRUE)
+```
 
+### 5.3) Summary Statistics
+```{r}
 # generate summary statistics
 summarized_data <- combined_data %>%
   map(~generate_summary_statistics(.)) %>%
   # extra step to get rid of NaN and Inf values
   map(~ {modify_if(.x, is.numeric, ~ ifelse(is.nan(.x) | is.infinite(.x), NA, .x))})
-
 ```
 
-Visualize all the data:
-
+### 5.4) Visualize Summary Statistics
 ```{r}
-plotz <- map(names(summarized_data), ~ {
+summary_plotz <- map(names(summarized_data), ~ {
   ggplot(data = summarized_data[[.x]]) +
     geom_point(aes(x = DT_round, y = mean), na.rm = TRUE) +
     labs(
@@ -576,564 +533,549 @@ plotz <- map(names(summarized_data), ~ {
     theme_minimal()
 })
 
-walk(plotz, print)
+walk(summary_plotz, print)
 ```
 
-## 6) Single-sensor flags
+### 5.5) Back-Calibration
+
+#### 5.5.1) Load Calibration Data
+```{r read-cal-data}
+# This creates calibration_data list object needed for the back-calibration functions
+# 2022 cal_data is present
+load_calibration_data(
+  cal_data_file_path = here::here("data", "collated", "sensor", "cal_reports", "munged_calibration_data.RDS"),
+  update = FALSE, # set to TRUE when running for the first time
+  field_cal_dir = here::here("data", "raw", "sensor", "calibration_reports")
+)
+```
+
+When initially running this script, only five sites were passed to the back-calibration app. Upon further inspection, it was discovered that the site names in the calibration data did not match the site names in the sensor data. Although the 'fix_site_names()' function works for sensor_data, it does not work for calibration data. The following code fixes this issue by renaming the sites in the calibration data to match the sensor data (updated site names).
+
+Worth noting is we do not have calibration data for Udall during this year.
+```{r fix-cal-site-names}
+
+calibration_data[["2022"]] <- calibration_data[["2022"]] %>% 
+  bind_rows() %>% 
+  mutate(site = if_else(site == "rist", "bellvue", site),
+         site = if_else(site == "legacy", "salyer", site),
+         site = if_else(site == "lincoln", "udall", site),
+         site = if_else(site == "timberline", "riverbend", site),
+         site = if_else(site == "prospect", "cottonwood", site),
+         site = if_else(site == "boxelder", "elc", site)
+         ) %>% 
+  split(f = list(.$site, .$sensor), sep = "-")
+
+```
+
+#### 5.5.2) Join Sensor & Cal Data
+
+Organize sensor data to match calibration data
+```{r organize-sensor-data}
+# Results in a nested list structure: `sensor_data$2022$site-parameter`
+sensor_data <- tidy_data %>%
+  bind_rows() %>%
+  split(f = year(.$DT_round)) %>%
+  map(~ {
+    split_data <- split(.x, f = list(.x$site, .x$parameter), sep = "-")
+    discard(split_data, ~is.null(.) || nrow(.) == 0)
+  })
+```
+
+Join sensor & calibration data
+```{r join-cal-data}
+sensor_calibration_data <- cal_join_sensor_calibration_data(
+  sensor_data_list = sensor_data,
+  calibration_data_list = calibration_data
+)
+# No calibration data for lincoln/udall
+# This results in the lack of udall files in post back-calibration file.
+```
+
+Prep data for back-calibration
+```{r prep-data}
+prepped_snsr_cal_data <- cal_prepare_calibration_windows(
+  sensor_calibration_data_list = sensor_calibration_data
+) 
+```
+
+#### 5.5.3) Back-Calibrate Sensor Data
+```{r apply-back-cal}
+calibrated_data <- prepped_snsr_cal_data%>%
+  map(function(year){
+    year%>%
+      map(function(site_param){
+        site_param %>% 
+          map_dfr(function(chunk){
+            cal_back_calibrate(chunk)
+          })
+      })
+  })
+```
+
+#### 5.5.4) Save Back-Calibrated Data
+
+Write back-calibrated data as an .rds file in the 2022 dir
+```{r}
+write_rds(calibrated_data, here(base_dir,"hydro_vu_pull","back_calibration", "calibrated_sensor_data_2022.rds"))
+```
+
+From here, we will review the back-calibrated data in the calibration_correction_tool ShinyApp.
 
 ```{r}
-# Chunk the data for furrr
-summarized_data_chunks <- split(1:length(summarized_data),
-                                ceiling(seq_along(1:length(summarized_data))/10))
-# Flag data...
-# Single parameter flags
+# Run app
+shiny::shinyAppDir(
+  appDir = here("calibration_correction_tool"),
+  options = list(width = "100%", height = "100%")
+)
+```
 
-# Process the chunk in parallel
-single_sensor_flags <- summarized_data %>%
-  map(
-    function(data) {
-      flagged_data <- data %>%
-        data.table(.) %>%
-        # flag field visits
-        add_field_flag(df = .) %>%
-        # flag missing data
-        add_na_flag(df = .) %>%
-        # flag DO noise
-        find_do_noise(df = .) %>%
-        # flag repeating values
-        add_repeat_flag(df = .) %>%
-        # find times when sonde was moved up/down in housing
-        # add_depth_shift_flag(df = ., level_shift_table =  all_field_notes, post2024 = FALSE) %>%
-        # find instances of sensor drift (FDOM, Chl-a, Turbidity only)
-        add_drift_flag(df = .)
-      
-      if (unique(data$parameter) %in% names(sensor_thresholds)) {
-        # flag instances outside the spec range
-        flagged_data <- flagged_data %>%
-          data.table(.) %>%
-          add_spec_flag(df = ., spec_table = sensor_thresholds)
-      }
-      
-      if (unique(data$parameter) %in% unique(season_thresholds$parameter)) {
-        # flag instances outside the spec range
-        flagged_data <- flagged_data %>%
-          data.table(.) %>%
-          add_seasonal_flag(df = ., threshold_table = season_thresholds)
-      }
-      
-      flagged_data <- flagged_data %>%
-        data.table(.)
-      
-      return(flagged_data)
+### 5.6) Manual Calibration Verification
+
+#### 5.6.1) Load Finalized Back-Calibrated Data
+
+Load our finalized calibrated data. This is the file generated from finalization of the back-calibration ShinyApp
+```{r}
+calibrated_data_final <- read_rds(here("data", "raw", "sensor", "manual_data_verification", "2022_cycle","hydro_vu_pull","back_calibration", "calibrated_sensor_field_data_finalized.rds"))[["2022"]]
+```
+
+#### 5.6.2) Plot Calibrated Data
+```{r}
+plots <- map(names(calibrated_data_final), 
+             function(site_param) {
+               plot_data <- calibrated_data_final[[site_param]]
+               
+               vline_df <- plot_data %>% 
+                 group_by(sensor_date) %>% 
+                 slice_min(DT_round, n = 1) %>%
+                 arrange(DT_round)%>%
+                 ungroup()%>%
+                 select(DT_round, file_date)%>%
+                 mutate(file_date_mst = with_tz(file_date, tzone = "MST"), 
+                        file_date_mst_utc = force_tz(file_date_mst, tzone = "UTC"))
+               
+               param <- unique(plot_data$parameter)
+               site <- unique(plot_data$site)
+               
+               ggplotly(ggplot(plot_data, aes(DT_round))+
+                          geom_line(aes(y = mean, color = "raw"))+
+                          geom_line(aes(y = mean_cal, color = "final"))+
+                          geom_vline(xintercept = vline_df$file_date_mst_utc, linetype = "dashed")+
+                          scale_color_manual(name = "Data Type", values = c("raw" = "blue", "final" = "green4"))+
+                          labs(title = paste0(site, " - ", param),
+                               x = "Date",
+                               y = param))
+             })%>%
+  set_names(names(calibrated_data_final))
+
+#Typically easiest to go parameter-wise through the plots 
+plots[grepl("pH", names(plots))]
+```
+
+#### 5.6.3) Tidy Back-Calibrated Data
+
+Here we are removing columns that are not needed downstream to reduce memory usage.
+We are also merging back in the units, n_obs, spread and flag columns from the original tidy data.
+Temperature and Depth are not passed into the back-calibration process so we will grab those from the original tidy data as well.
+We will also add the column "back_cal_performed" to indicate whether a back-calibration was actually applied to the data or not.
+
+```{r}
+cal_corrected_data <- calibrated_data_final%>%
+  map(., function(df){
+    
+    site <- unique(df$site)
+    parameter <- unique(df$parameter)
+    
+    site_param = paste0(site, "-", parameter)
+    
+    add_data <- tidy_data[[site_param]]%>%
+      select( DT_join, units, n_obs, spread, flag)
+    
+    if("updated_slope_from" %in% names(df)){
+      df <- df%>%
+        mutate(back_cal_performed = if_else(slope == updated_slope_to & slope == updated_slope_from, F, T))
+    } else {
+      df <- df%>%
+        mutate(back_cal_performed = F)
     }
-  )
+    
+    df%>%
+      select(
+        DT_round,
+        site,
+        parameter,
+        mean_pre_cal = mean,
+        mean = mean_cal,
+        back_cal_performed
+      )%>%
+      mutate(DT_join = as.character(DT_round))%>%
+      left_join(add_data, by = c("DT_join"))
+  })
+
+# Since Udall (lincoln) data was not included in the post back-calibration data, we will need to grab that data from the tidy_data object and merge it here as well.
+# We will also need to grab the Depth and Temperature data (not back calibrated) and merge it here.
+non_cal_udall_data <- tidy_data %>%
+  keep(~unique(.$site) %in% c("udall")) %>% 
+    map(., function(df){
+    df%>%
+      mutate(back_cal_performed = FALSE,
+             mean_pre_cal = mean)%>%
+      select(,
+             DT_round,
+             site,
+             parameter,
+             mean_pre_cal,
+             mean,
+             back_cal_performed,
+             DT_join,
+             units,
+             n_obs,
+             spread,
+             flag
+      )
+  })
+
+non_cal_corrected_data <- tidy_data%>%
+  keep(~unique(.$parameter) %in% c("Depth", "Temperature"))%>%
+  map(., function(df){
+    df%>%
+      mutate(back_cal_performed = FALSE,
+             mean_pre_cal = mean)%>%
+      select(,
+             DT_round,
+             site,
+             parameter,
+             mean_pre_cal,
+             mean,
+             back_cal_performed,
+             DT_join,
+             units,
+             n_obs,
+             spread,
+             flag
+      )
+  })
+
+# Bind all data together
+tidy_cal_data <- c(cal_corrected_data, non_cal_udall_data, non_cal_corrected_data)
 ```
 
-## 7) Intrasensor flags (by site)
-
+Now, we'll combine the field notes for a final dataset that can undergo data-flagging
 ```{r}
-# Intrasensor flags
-intrasensor_flags <- single_sensor_flags %>%
-  rbindlist(fill = TRUE) %>%
-  split(by = "site")
+# Add the field note data to our tidy data
+combined_data <- tidy_cal_data %>%
+  future_map(~add_field_notes(df = ., notes = field_notes), .progress = TRUE)
 
-# Chunk the data for furrr
-intrasensor_data_chunks <- split(1:length(intrasensor_flags),
-                                 ceiling(seq_along(1:length(intrasensor_flags))/3))
-
-intrasensor_flags_list <- list()
-for (chunk_idx in seq_along(intrasensor_data_chunks)) {
-  message("\n=== Processing chunk ", chunk_idx, " of ", length(intrasensor_data_chunks), " ===")
-  
-  # Get the indices for this chunk
-  indices <- intrasensor_data_chunks[[chunk_idx]]
-  chunk_data <- intrasensor_flags[indices]
-  # Process the chunk in parallel
-  chunk_results <- chunk_data %>%
-    map(
-      function(data) {
-        # A chunk is a site df
-        flagged_data <- data %>%
-          data.table() %>%
-          # flag times when water was below freezing
-          add_frozen_flag(.) %>%
-          # overflagging correction. remove slope violation flag if it occurs concurrently
-          # with temp or depth
-          intersensor_check(.) %>%
-          # add sonde burial. If DO is noise is long-term, likely burial:
-          add_burial_flag(.) %>%
-          # flag times when sonde was unsubmerged
-          add_unsubmerged_flag(.)
-        
-        return(flagged_data)
-      }, .progress = TRUE
-    ) %>%
-    rbindlist(fill = TRUE) %>%
-    # lil' cleanup of flag column contents
-    dplyr::mutate(flag = ifelse(flag == "", NA, flag)) %>%
-    # transform back to site-parameter dfs
-    split(f = list(.$site, .$parameter), sep = "-") %>%
-    purrr::discard(~ nrow(.) == 0) %>%
-    # Add in KNOWN instances of sensor malfunction
-    map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
-  
-  # Add chunk to list
-  intrasensor_flags_list <- c(intrasensor_flags_list, chunk_results)
-  
-  if (chunk_idx < length(intrasensor_data_chunks)) {
-    message("Taking a short break before next chunk...")
-    gc()
-    Sys.sleep(0.1)
-  }
-}
+# Add summary statistics
+summarized_data <- combined_data %>%
+  map(~generate_summary_statistics(.))
 ```
 
-## 8) Simple network consistency check
+## 6) Data Flagging
 
-We apply a lightweight, order-aware comparison (upstream/downstream) to remove flags that are likely true environmental events observed across neighboring sites in a ±2-hour window. The site order defaults to CSU/FCW segments, with overrides for alternative networks.
+### 6.1) Single-Sensor Flagging
+
+The first stage of data flagging is within each sensor itself, operating on a per-site-parameter basis.
+These next functions apply flags to the data based on the following criteria:
+- Field visit notes
+- Missing data
+- Repeating values
+- Depth shifts
+- Optical sensor drift
+- Specification range violations
+- Seasonal range violations
 
 ```{r}
-#get site order for original PWQN network (pre-2023)
-site_order_list <- load_site_order(file_path = here("data", "derived", "auto_qaqc_files", "site_order", "site_order_pre2023.yml"))
+# Create temporary directory for single-sensor intermediate files
+single_temp_dir <- here(flagged_temp_dir, "single_sensor")
+if (!dir.exists(single_temp_dir)) dir.create(single_temp_dir, recursive = TRUE)
 
-final_flags <- intrasensor_flags_list %>%
-  purrr::map(~network_check(df = ., intrasensor_flags_arg = intrasensor_flags_list, site_order_arg = site_order_list)) %>%
+# Process and write directly to disk in parallel
+future_walk(
+  summarized_data,
+  function(data) {
+    flagged_data <- data %>%
+      data.table() %>%
+      # flag field visits
+      add_field_flag(df = .) %>%
+      # flag missing data
+      add_na_flag(df = .) %>%
+      # flag DO noise
+      find_do_noise(df = .) %>%
+      # flag repeating values
+      add_repeat_flag(df = .) %>%
+      # find times when sonde was moved up/down in housing
+      add_depth_shift_flag(df = ., level_shift_table = field_notes) %>%
+      # find instances of sensor drift (FDOM, Chl-a, Turbidity only)
+      add_drift_flag(df = .)
+    
+    param <- unique(data$parameter)
+    site_name <- unique(data$site)
+    
+    if (param %in% names(sensor_thresholds)) {
+      flagged_data <- add_spec_flag(flagged_data, spec_table = sensor_thresholds)
+    }
+    
+    if (param %in% unique(season_thresholds$parameter)) {
+      flagged_data <- add_seasonal_flag(flagged_data, threshold_table = season_thresholds)
+    }
+    
+    # Write to disk to avoid memory exhaustion
+    file_name <- paste0(site_name, "-", param, ".parquet")
+    write_parquet(flagged_data, file.path(single_temp_dir, file_name))
+  },
+  .progress = TRUE, .options = furrr_ops
+)
+
+# Free up summarized_data if no longer needed (optional but recommended)
+rm(summarized_data)
+gc()
+
+# beep to let you know when it's done
+beepr::beep(1)
+```
+
+### 6.2) Intra-Sensor Flagging
+
+The second stage of flagging requires multiple data parameters from the same sensor to be present.
+The intra-sensor function will flag data based on the following criteria:
+- Frozen water (temperature < 0°C)
+- Unsubmerged sonde (depth < 0 ft, specific conductivity < 10 µS/cm)
+- Buried sonde (long-term DO noise)
+
+To prevent overflagging, an inter-sensor check removes slope violation flags that occur concurrently with temp or depth violations.
+
+```{r}
+# Get the list of all single-sensor parquet files
+single_sensor_files <- list.files(single_temp_dir, pattern = "\\.parquet$", full.names = TRUE)
+
+# Group file paths by site
+sites <- sub("-.*", "", basename(single_sensor_files))
+site_grouped_files <- split(single_sensor_files, sites)
+
+# Ensure final temp dir exists
+if (!dir.exists(here(flagged_temp_dir))) dir.create(here(flagged_temp_dir), recursive = TRUE)
+
+# Process intra-sensor flags out-of-core
+future_walk(
+  site_grouped_files,
+  function(file_paths) {
+    # Read all files for this specific site
+    site_data_list <- purrr::map(file_paths, read_parquet)
+    site_data <- rbindlist(site_data_list, fill = TRUE)
+    
+    # Perform intra-sensor flagging
+    flagged_data <- site_data %>%
+      # flag times when water was below freezing
+      add_frozen_flag(.) %>%
+      # overflagging correction. remove slope violation flag if it occurs concurrently
+      # with temp or depth
+      intersensor_check(.) %>%
+      # add sonde burial. If DO is noise is long-term, likely burial:
+      add_burial_flag(.) %>%
+      # flag times when sonde was unsubmerged
+      add_unsubmerged_flag(.)
+      
+    # Clean up flag column and get distinct records
+    flagged_data <- flagged_data %>%
+      dplyr::mutate(flag = ifelse(flag == "", NA, flag)) %>%
+      distinct(site, parameter, DT_round, mean, .keep_all = TRUE)
+      
+    # Split back into site-parameter lists
+    split_data <- flagged_data %>%
+      split(f = list(.$site, .$parameter), sep = "-") %>%
+      purrr::discard(~ nrow(.) == 0) %>%
+      # Add in KNOWN instances of sensor malfunction
+      purrr::map(~add_malfunction_flag(df = ., malfunction_records = sensor_malfunction_notes))
+      
+    # Write each parameter back to disk in the main temp dir
+    purrr::iwalk(split_data, ~write_parquet(.x, here(flagged_temp_dir, paste0(.y, ".parquet"))))
+  }, .progress = TRUE, .options = furrr_ops
+)
+
+# beep to let you know when it's done
+beepr::beep(1)
+```
+
+Save the single-sensor/intra-sensor flagged data as a checkpoint.
+```{r}
+# Load the flagged datasets back in from temp dir for the network step
+intrasensor_flags_list <- list.files(here(flagged_temp_dir), pattern = "\\.parquet$", full.names = TRUE) %>%
+  purrr::map(~read_parquet(.x)) %>% 
+  set_names(list.files(here(flagged_temp_dir), pattern = "\\.parquet$", full.names = FALSE) %>%
+              stringr::str_remove("\\.parquet$"))
+```
+
+### 6.3) Network Flagging
+
+The function `ross.wq.tools::network_check()` compares data across sensor sites within the sonde network to identify over-flagging occurrences and remove flags when needed.
+
+This step requires knowledge of the site order, which is read in from a YAML file and should be updated as sites change.
+```{r}
+# Read in site order from YAML file (pre-2023)
+site_order_22 <- load_site_order(here("data","derived","auto_qaqc_files", "site_order", "site_order_pre2023.yml"))
+
+# Network flagging
+network_flags <- intrasensor_flags_list %>%
+  map(~network_check(df = ., intrasensor_flags_arg = intrasensor_flags_list, site_order_arg = site_order_22)) %>%
   rbindlist(fill = TRUE) %>%
   tidy_flag_column() %>%
-  split(f = list(.$site, .$parameter), sep = "_") %>%
-  purrr::map(~add_suspect_flag(.)) %>%
-  data.table::rbindlist(fill = TRUE)
-```
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  map(~add_suspect_flag(.)) %>%
+  rbindlist(fill = TRUE)
 
-
-## 9) Final post-processing & save outputs
-
-We remove isolated one-off “suspect data” points and write per-site/parameter CSVs for the reporting cycle.
-
-```{r}
-v_final_flags <- final_flags%>%
-  dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA,
-                                   ifelse(auto_flag == "suspect data" & is.na(lag(auto_flag, 1)) & is.na(lead(auto_flag, 1)), NA, auto_flag))) %>%
-  mutate(auto_flag = if_else(site == "udall", 
-                             str_replace(auto_flag, "sonde not employed", ""), 
-                             auto_flag))%>%
-  dplyr::select(c("DT_round", "DT_join", "site", "parameter", "mean", "units", "n_obs", "spread", "auto_flag", "mal_flag", "sonde_moved","sonde_employed", "season", "last_site_visit")) %>%
-  dplyr::mutate(auto_flag = ifelse(is.na(auto_flag), NA, ifelse(auto_flag == "", NA, auto_flag))) %>%
+# Final flagging
+final_flags <- network_flags %>%
+  mutate(auto_flag = case_when(
+    auto_flag == "suspect data" & is.na(lag(auto_flag, 1)) & is.na(lead(auto_flag, 1)) ~ NA_character_,
+    auto_flag == "" ~ NA_character_,
+    TRUE ~ auto_flag
+  )) %>%
+  select(c("DT_round", "DT_join", "site", "parameter", 
+           "mean_pre_cal", "mean", "units", "n_obs", "spread", 
+           "auto_flag", "mal_flag", "sonde_moved","sonde_employed", 
+           "season", "last_site_visit", "depth_change", "back_cal_performed")
+         ) %>%
   mutate(year = year(DT_round)) %>%
   split(f = list(.$site, .$parameter), sep = "_") %>%
   keep(~nrow(.) > 0)
+
+# beep to let you know when it's done
+beepr::beep(1)
 ```
 
-## 10) Final plot for sanity checks
 ```{r}
-sitewise_data <- v_final_flags %>%
-  bind_rows()%>%
-  split(f = list(.$site), sep = "_") 
-
-ggplot(data = sitewise_data[["bellvue"]]) +
-  geom_point(aes(x = DT_round, y = mean, color = auto_flag), na.rm = TRUE) +
-  facet_wrap(~parameter, scales = "free_y") +
-  labs(
-    title = "Udall",
-    x = "Date/Time",
-    y = "Mean Value"
-  )
-
-final_plots <- map(names(sitewise_data), ~ {
-   ggplot(data = sitewise_data[[.x]]) +
-     geom_point(aes(x = DT_round, y = mean, color = auto_flag), na.rm = TRUE) +
-    facet_wrap(~parameter, scales = "free_y")+
-    #theme(legend.position = "none") +
-     labs(
-       title = .x,
-       x = "Date/Time",
-       y = "Mean Value"
-     ) })
-final_plots
-
-
-
-```
-
-## 11) Save final flags (Parquet)
-```{r}
-# Save files
-iwalk(v_final_flags, ~ {
-  site_name <- str_split(.y, "_")[[1]][1]  # Extract just the site name (first part)
-  parm <- str_split(.y, "_")[[1]][2]
-  year <- "2022"
-  data_dir  <- here("data", "raw", "sensor", "manual_data_verification", paste0(year, "_cycle"), "hydro_vu_pull", "flagged")
-  if (!dir.exists(data_dir)) {
-    dir.create(data_dir, recursive = TRUE)
-  }
-  
-  filename <- here("data","raw", "sensor", "manual_data_verification", paste0(year, "_cycle"), "hydro_vu_pull", "flagged", paste0(tolower(site_name), "_", parm, ".parquet"))
-  .x %>% select(-year) %>% write_parquet(filename)
-  cat("Saved:", filename, "\n")
-})
-```
-
-## 12) Check Timestamps
-
-```{r}
-# summer temp comparison
-rist_plot<- rist_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), 
-         water_temp = as.numeric(value), 
-         year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), 
-            .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "Rist (Mean Temp July-Aug)")
-
-legacy_plot<- legacy_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), 
-         water_temp = as.numeric(value), 
-         year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), 
-            .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "Legacy (Mean Temp July-Aug)")
-
-lincoln_plot<- lincoln_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), 
-         water_temp = as.numeric(value), 
-         year = as.character(year(timestamp)))%>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), 
-            .by = c("hour", "year"))%>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "Lincoln (Mean Temp July-Aug)")
-
-
-timberline_plot <- timberline_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), water_temp = as.numeric(value), year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "Timberline")
-
-prospect_plot <- prospect_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), water_temp = as.numeric(value), year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year))+
-  geom_line() +
-  labs(title = "Prospect")
-
-elc_plot <- elc_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), water_temp = as.numeric(value), year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "ELC")
-
-archery_plot <- archery_final %>%
-  filter(parameter == "Temperature") %>%
-  filter(month(timestamp) %in% c(7,8,9)) %>%
-  mutate(hour = hour(timestamp), water_temp = as.numeric(value), year = as.character(year(timestamp))) %>%
-  summarise(mean_temp = mean(water_temp, na.rm = T), .by = c("hour", "year")) %>%
-  ggplot(aes(hour, mean_temp, color = year)) +
-  geom_line() +
-  labs(title = "Archery")
-
-ggarrange(rist_plot, legacy_plot, lincoln_plot, 
-          timberline_plot, prospect_plot, elc_plot, archery_plot, 
-          ncol = 2, nrow = 4, 
-          common.legend = TRUE, legend = "bottom")
-
-
-# Checking ELC depth and discharge against USGS
-plot_data <- all_sites_corrected %>%
-  filter(site == "elc" & parameter == "Depth") %>%
-  fix_site_names() %>%
-  mutate(year = year(timestamp))
-
-# Get instantaneous discharge (Q) data at ELC
-q_inst <- dataRetrieval::readNWISuv(
-  siteNumbers = "06752280" ,
-  parameterCd = "00060",
-  startDate = "2022-01-01",
-  endDate = "2022-12-31"
-)
-
-plotly::ggplotly(
-  plot_data %>%
-    ggplot() +
-    geom_point(aes(x = timestamp, y = value), color = "black") +
-    geom_line(
-      data = q_inst %>%
-        filter(between(dateTime, as_date("2022-01-01"), as_date("2022-12-31"))) %>%
-        rename(q_cfs = X_00060_00000) %>%
-        # rescale discharge to match plot_data value range
-        mutate(value = scales::rescale(q_cfs, to = range(plot_data$value, na.rm = TRUE))),
-      aes(x = dateTime, y = value),
-      color = "blue") +
-    labs(x = "Date",
-         y = "Sonde (Black) + USGS (Blue)") +
-    theme_minimal())
-
-
-# Checking Lincoln depth and discharge against USGS
-plot_data <- all_sites_corrected %>%
-  filter(site == "udall" & parameter == "Depth") %>%
-  fix_site_names() %>%
-  mutate(year = year(timestamp))
-
-# Get instantaneous discharge (Q) data at Lincoln
-q_inst <- dataRetrieval::readNWISuv(
-  siteNumbers = "06752260" ,
-  parameterCd = "00060",
-  startDate = "2022-01-01",
-  endDate = "2022-12-31"
-)
-
-plotly::ggplotly(
-  plot_data %>%
-    ggplot() +
-    geom_point(aes(x = timestamp, y = value), color = "black") +
-    geom_line(
-      data = q_inst %>%
-        filter(between(dateTime, as_date("2022-01-01"), as_date("2022-12-31"))) %>%
-        rename(q_cfs = X_00060_00000) %>%
-        # rescale discharge to match plot_data value range
-        mutate(value = scales::rescale(q_cfs, to = range(plot_data$value, na.rm = TRUE))),
-      aes(x = dateTime, y = value),
-      color = "blue") +
-    labs(x = "Date",
-         y = "Sonde (Black) + USGS (Blue)") +
-    theme_minimal())
-
-
-# DO and Temp
-#calculate the median values by hour
-subset_no_corr <- all_sites_corrected %>%
+final_plot_data <- final_flags %>% 
   bind_rows() %>%
-  mutate(year = year(timestamp) )%>%
-  filter(year == 2022) %>%
-  filter(parameter %in% c("DO", "Temperature")) %>%
-  # No correction (assuming data already in UTC)
-  mutate(hour = hour(timestamp),
-         month = month(timestamp),
-         season = dplyr::case_when(
-           month %in% c(12, 1, 2, 3, 4) ~ "winter_baseflow",
-           month %in% c(5, 6) ~ "snowmelt",
-           month %in% c(7, 8, 9) ~ "monsoon",
-           month %in% c(10, 11) ~ "fall_baseflow",
-           TRUE ~ NA_character_)) %>%
-  group_by(hour, parameter, site, season) %>%
-  summarize(median_value = median(value, na.rm = TRUE))
-
-# plot the median values by hour
-then_utc <- ggplot(subset_no_corr %>% filter(season == "monsoon" ), aes(x = hour, y = median_value, color = site)) +
-  geom_line() +
-  labs(title = "Hourly Medians by site 2022 (No Correction)",
-       x = "Hour of Day (UTC)",
-       y = "Median") +
-  facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
-  theme_bw()
-
-# pull in 2024 data for comparison
-filtered_2024 <- map(list.files(path = "data/raw/sensor/manual_data_verification/2024_cycle/hydro_vu_pull/flagged/", 
-                                pattern = "*.csv", 
-                                full.names = TRUE), fread) %>%
-  bind_rows() %>%
-  filter(site %in% unique(subset_no_corr$site))%>%
-  filter(parameter %in% c("DO", "Temperature"))%>%
-  mutate(hour = hour(DT_round))%>%
-  group_by(hour, parameter, site, season) %>%
-  summarize(median_value = median(mean, na.rm = TRUE))
-
-# plot the median values by hour
-now_utc <- ggplot(filtered_2024 %>% filter(season == "monsoon" ), aes(x = hour, y = median_value, color = site)) +
-  geom_line() +
-  labs(title = "Hourly Medians by site - 2024",
-       x = "Hour of Day (UTC)",
-       y = "Median") +
-  facet_wrap(~ parameter, scales = "free_y", ncol = 3) +
-  theme_bw()
-
-# create a combined plot
-ggpubr::ggarrange(then_utc, now_utc, ncol = 1, nrow = 3, common.legend = TRUE, legend = "bottom")
-```
-
-
-### Save data into Shiny Ver Tool formatting
-
-```{r}
-
-data_to_ver <- v_final_flags%>%
-  bind_rows()%>%
-  split(f = list(.$year), sep = "_")%>%
+  split(f = list(.$site)) %>%
   keep(~nrow(.) > 0)
-
-iwalk(data_to_ver, \(x, idx) {
-  message("Processing year: ", idx)
-  base_dir = here("data", "raw", "sensor", "manual_data_verification", paste0(idx, "_cycle"), "in_progress")
-  all_path = here(base_dir, "all_data_directory")
-  pre_verification_path = here(base_dir, "pre_verification_directory")
-  intermediary_path = here(base_dir, "intermediary_directory")
-  verified_path = here(base_dir, "verified_directory")
-  raw_data_path = here(base_dir, "raw_data")
-  meta_folder_path = here(base_dir, "meta")
   
-  
-  #check/ create all necessary folders
-  if(!dir.exists(all_path)){
-    dir.create(all_path, recursive = TRUE)
-  }
-  #check to see if data folder has pre_verification_directory
-  if(!dir.exists(pre_verification_path)){
-    dir.create(pre_verification_path)
-  }
-  #check to see if data folder has intermediary_directory
-  if(!dir.exists(intermediary_path)){
-    dir.create(intermediary_path)
-  }
-  
-  #check to see if data folder has verified_directory
-  if(!dir.exists(verified_path)){
-    dir.create(verified_path)
-  }
-  #create raw data folder
-  if(!dir.exists(raw_data_path)){
-    dir.create(raw_data_path)
-  }
-  if(!dir.exists(meta_folder_path)){
-    dir.create(meta_folder_path)
-  }
-  
-  all_data_parsed <- x%>%
-    #double check we are only saving one year
-    filter(year == idx)%>%
-    mutate(DT_round = with_tz(DT_round, tzone = "MST"))
-  
-  #Taking all_data_parsed and formatting to save into all and pre directories
-  site_params <- expand_grid(site = unique(all_data_parsed$site), parameter = unique(all_data_parsed$parameter))
-  #create a list were each is named after the site and parameter combination
-  flagged_list <- pmap(site_params, ~ all_data_parsed %>% filter(site == ..1, parameter == ..2))
-  rm(all_data_parsed) #save some memory here
-  names(flagged_list) <- paste(site_params$site, site_params$parameter, sep = "-")
-  #remove empty lists
-  flagged_list <- keep(flagged_list, ~nrow(.x) > 0)
-  #add additional columns needed
-  pre_processed_data <- map(.x = flagged_list, \(x)
-                            x %>%
-                              mutate(
-                                mean_verified = mean, # if verification status pass or flag, this is mean. set default to mean so that it can be used in the app
-                                is_verified = FALSE, # whether or not the data has been verified
-                                verification_status = NA, # can only be pass/fail/skip
-                                year = year(DT_round),
-                                week = week(DT_round),
-                                weekday = lubridate::wday(DT_round, week_start = 7),
-                                y_w = paste(year, "-", week),
-                                day = yday(DT_round),
-                                y_d = paste(year, "-", day),
-                                #based on Colorado Hydrology, should be removed for DS version
-                                season = case_when(
-                                  month(DT_round) %in% c(12, 1, 2, 3, 4) ~ "winter_baseflow",
-                                  month(DT_round) %in% c(5, 6) ~ "snowmelt",
-                                  month(DT_round) %in% c(7, 8, 9) ~ "monsoon",
-                                  month(DT_round) %in% c(10, 11) ~ "fall_baseflow"
-                                ),
-                                #auto_flag = flag,
-                                #merge auto_flag and mal_flag by ; into flag. don't include NAs
-                                flag = case_when(
-                                  #both are flagged then combine by ;
-                                  !is.na(auto_flag)&!is.na(mal_flag) ~ paste(auto_flag, mal_flag, sep = ";"),
-                                  #only auto_flag is flagged, only use auto_flag
-                                  !is.na(auto_flag)&is.na(mal_flag) ~ auto_flag,
-                                  #only mal_flag is flagged, only use mal_flag
-                                  !is.na(mal_flag)&is.na(auto_flag) ~ mal_flag
-                                ),
-                                user_flag = flag, # Keep Auto flags in flag column, user added flags/alterations live in user flag
-                                brush_omit = FALSE, # User Brush Omit instances, default to FALSE
-                                user = NA, #User initials
-                                final_status = NA, # Final status of the data point after weekly decision
-                                week_decision = NA,  #store weekly decision
-                                is_finalized = FALSE) #Only TRUE if user submits final decision button
-  )
-  
-  rm(flagged_list) #save some memory here
-  
-  iwalk(pre_processed_data, \(x, idx) {
-    timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
-    data_hash <- digest::digest(x)
-    new_filename <- glue::glue("{idx}_{timestamp}_{data_hash}.parquet")
-    write_parquet(x, here(all_path, new_filename))  # Ensure you use new_filename, not idx
-  })
-  
-  R.utils::copyDirectory(all_path, pre_verification_path)
-  message("Files saved to all and pre directory")
+final_plotz <- map(names(final_plot_data), ~ {
+  ggplot(data = final_plot_data[[.x]]) +
+    geom_point(aes(x = DT_round, y = mean, color = auto_flag), na.rm = TRUE) +
+    facet_wrap(~parameter, scales = "free_y") +
+    #remove legend for auto_flag
+    theme(legend.key = element_blank(),
+          legend.title = element_blank(),
+          legend.position = "none") +
+    labs(
+      title = .x,
+      x = "Date/Time",
+      y = "Mean Value"
+    )
 })
 
+walk(final_plotz, print)
 ```
 
-# Future Work
+### 6.4) Save Final Flagged Dataset
 
-## Drift Correction post-ver
+With all flagging steps complete, we'll save the results in two separate directories:
+- Individually flagged site-parameter parquet files for posterity and comparison with manual verification.
+- A single combined parquet file for use in the manual verification process.
 
 ```{r}
-#Create a post_verification_directory for each cycle
-years <- c(2022)
+# Save individual datasets 
+iwalk(final_flags, ~write_parquet(.x, here(flagged_dir, paste0(.y, ".parquet"))))
 
-walk(years, ~ {
-  dir_path <- here("data", "raw", "sensor", "manual_data_verification", paste0(.x, "_cycle"), "post_verification")
-  if(!dir.exists(dir_path)) {
-    dir.create(dir_path, recursive = TRUE)
-  }
-})
+# Saving our data into the "raw_data" folder of the manual verification folder for use in the shiny app
+# We want to convert from UTC to MST for the manual verification process
+write_parquet(final_flags %>% bind_rows(), here(base_dir,"in_progress","raw_data","raw_data_2022.parquet"))
+
+# # Load the flagged datasets back in from temp dir (if needed)
+# final_flags_par <- read_parquet(here(base_dir,"in_progress","raw_data","raw_data_2022.parquet"))
+# final_flags_par$DT_round <- with_tz(final_flags_par$DT_round, tzone = "US/Mountain")
 
 ```
 
+## 7) Shiny Tools & Data Preparation
 
-## Prep for HydroShare Upload
+### 7.1) Shiny Verification Tool
 
-Copied from `Process_2025.rmd` but should have the same format
+For manual verification of the data, a ShinyApp has been created that allows users to visualize the data, review the flags, make any necessary corrections, and save the output. The application, and all associated files, are located within "~/manual_verification_tool".
 
+Key columns added by the tool include:
+- final_status:
+  - "PASS":  user has verified the data as good
+  - "FLAGGED": user has flagged the data for suspect but still usable data
+  - "OMIT": user has concluded that the data should not be used in analysis due to sensor error. 
+- user_flag:
+  - Specific flag added by user to indicate why data was flagged/omitted. (e.g. "suspect data", "sonde burial",
+  "frozen water", "unsubmerged", "depth shift", "drift", "field visit", "other malfunction" etc). 
+  This is for posterity and to help inform auto-flagging performance. 
+- mean_analysis: 
+  - Values where the "OMIT" final status was not applied.
+  
+Once complete, the output is saved in the "verified_directory" for the specified year
+
+```{r shiny-dependencies}
+# Load required packages for ShinyApp
+invisible(lapply(c("shiny","bslib","DT","tidyverse","lubridate","here","ggpubr","gridExtra","plotly",
+                   "keys","patchwork","digest","fs","shinyFiles","shinyWidgets","glue","anytime","arrow"),
+                 package_loader)
+          )
+```
+
+Run this codechunk to launch the manual verification tool. The app will open in a new window or tab in your default web browser.
+```{r, echo=FALSE}
+
+shiny::shinyAppDir(
+  appDir = here("manual_verification_tool"),
+  options = list(width = "100%", height = "100%")
+)
+```
+
+### 7.2) Drift Correction Tool
+
+Optical sensor drift is a common issue with in-situ sonde deployments, namely turbidity, fDOM and Chl-A. 
+
+This tool is located in the script `drift_correction_tool`.
+Here we are applying the drift corrections identified in the manual verification tool to the data and then saving the output in the "post_verification" folder.
+
+The key columns added are:
+
+- mean_drift_trans: new data column with drift corrected values
+
+- correction_type: what kind of drift correction was applied (exponential, fitted linear, etc)
+
+  - This can also be "non_resolved" if the drift could not be appropriately solved via the current methods.
+    These data are then moved from final_status = "FLAGGED" to final_status = "OMIT"
+    
+- pre_post_source: A, B, C depending on where the correction values came from
+
+  - Outlined in `data_organization/drift_correction_2024.rmd`
+  
+```{r, echo=FALSE}
+
+shiny::shinyAppDir(
+  appDir = here("drift_correction_tool"),
+  options = list(width = "100%", height = "100%")
+)
+```
+
+### 7.3) Data Preparation for HydroShare Publication
 
 We will be creating two datasets here: 
-- A "raw" dataset that includes all the original data with flags and all "versions" of the data: no manual corrections applied, calibration correction, post verification, and post drift correction. This is for posterity and to have a record of what the original data looked like before and after manual verification/corrections.
-- A "cleaned" dataset that includes only the final value (post drift correction if it exists, post verification if not) and a column indicating what modifications were made to the data (manual exclusion, calibration correction, drift correction, etc). This is the dataset that will be uploaded to HydroShare and used for analysis.
+- A "raw" dataset that includes all the original data with flags and all "versions" of the data: no manual corrections applied, calibration correction, post verification, and post drift correction.
+This is for posterity and to have a record of what the original data looked like before and after manual verification/corrections.
+- A "cleaned" dataset that includes only the final value (post drift correction if it exists, post verification if not) and a column indicating what modifications were made to the data (manual exclusion, calibration correction, drift correction, etc).
 
-### Prep Data
+This is the dataset that will be uploaded to HydroShare and used for analysis.
 
 ```{r}
-
-years <- c(2022)
-hydro_share_datasets <- map(years, ~function(year_cycle){
-  
-  
-drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", paste0(year_cycle, "_cycle"), "/post_verification/"), pattern = "*.parquet", full.names = TRUE)
+drift_corrected_files <- list.files(path = 'data/raw/sensor/manual_data_verification/2022_cycle/post_verification/', pattern = "*.parquet", full.names = TRUE)
 
 drift_corrected_data <- map_dfr(drift_corrected_files, read_parquet)%>%
-  select(DT_round, DT_join, site, parameter,units, 
-         value_raw = mean,  
-         value_post_ver = mean_analysis, 
-         value_post_drift_corr = mean_drift_trans,   
-         auto_qc_flag = auto_flag, mal_flag, user_qc_flag = user_flag, qc_status = final_status)%>%
+  select(DT_round, DT_join, site, parameter,units, value_raw = mean_pre_cal, value_post_cal_corr = mean, value_post_ver = mean_analysis, value_post_drift_corr = mean_drift_trans,   auto_qc_flag = auto_flag, mal_flag, user_qc_flag = user_flag, qc_status = final_status)%>%
   split(f = list(.$site, .$parameter), sep = "-")%>%
   keep(~ nrow(.x) > 0) #remove any empty datasets
 
-non_drift_corrected_files <- list.files(path = here("data/raw/sensor/manual_data_verification/", paste0(year_cycle, "_cycle"), "/verified_directory/"), pattern = "*.parquet", full.names = TRUE)
+non_drift_corrected_files <- list.files(path = 'data/raw/sensor/manual_data_verification/2022_cycle/in_progress/verified_directory/', pattern = "*.parquet", full.names = TRUE)
 
 non_drift_corrected_data <- map_dfr(non_drift_corrected_files, read_parquet)%>%
   mutate( mean_analysis = ifelse(verification_status %in% c("FLAGGED", "PASS"), mean, NA))%>%
   select(DT_round, DT_join, site, parameter,units,
-         value_raw = mean, 
+         value_raw = mean_pre_cal, 
+         value_post_cal_corr = mean, 
          value_post_ver = mean_analysis,
          auto_qc_flag = auto_flag, 
          mal_flag, 
@@ -1156,15 +1098,20 @@ units_table <- all_datasets%>%
 
 raw_dataset <- all_datasets%>%
   bind_rows()%>%
+  #exclude springcreek and boxcreek since they were not verified in 2025
+  filter(!(site %in% c("springcreek", "boxcreek")))%>%
   # if value_post_drift corr is NA, then fill with value_post_ver (this means that the data was verified but not drift corrected, so the post verification value is the most "final" version of the data we have for those instances) This is for parameters other than FDOM and Turbidity
   mutate(value_post_drift_corr = if_else(is.na(value_post_drift_corr), value_post_ver, value_post_drift_corr),
          #round all values to 3 decimal places for consistency with HydroShare upload
          value_raw = round(value_raw, 3),
+         value_post_cal_corr = round(value_post_cal_corr, 3),
          value_post_ver = round(value_post_ver, 3),
          value_post_drift_corr = round(value_post_drift_corr, 3),
          #Create modifications column to indicate what modifications were made to the data for easier filtering and analysis downstream
          modifications = case_when( is.na(value_post_ver) & !is.na(value_raw) ~ "manual data exclusion",
                                     value_raw == value_post_cal_corr & value_post_ver != value_post_drift_corr ~ "drift correction",
+                                    value_raw != value_post_cal_corr & value_post_ver == value_post_drift_corr ~ "calibration correction",
+                                    value_raw != value_post_cal_corr & value_post_ver != value_post_drift_corr ~ "calibration correction;drift correction",
                                     TRUE ~ NA), 
          #convert to UTC
          DateTime_UTC = with_tz(DT_round, tzone = "UTC"))%>%
@@ -1175,103 +1122,48 @@ raw_dataset <- all_datasets%>%
          site, parameter, units, 
          #Actual data
          value_raw, 
+         value_post_cal_corr,
          value_post_ver,
          value_post_drift_corr, 
          #QC Info
          auto_qc_flag, mal_flag, user_qc_flag, qc_status, modifications)
     
 final_dataset <- raw_dataset %>%
-  select(DateTime_UTC, site, parameter, units, value_raw, value_final = value_post_drift_corr, user_qc_flag, modifications)
+  select(DateTime_UTC, site, parameter, units, value_raw, value_final = value_post_drift_corr,user_qc_flag, modifications)
 
-return(list(raw_dataset = raw_dataset, final_dataset = final_dataset))
-})
 ```
 
-#### Plot to Double Check 
+## 8) HydroShare Publication Prep
+
+We will be creating two datasets here: 
+- A "raw" dataset that includes all the original data with flags and all "versions" of the data: no manual corrections applied, calibration correction, post verification, and post drift correction. This is for posterity and to have a record of what the original data looked like before and after manual verification/corrections.
+- A "cleaned" dataset that includes only the final value (post drift correction if it exists, post verification if not) and a column indicating what modifications were made to the data (manual exclusion, calibration correction, drift correction, etc). This is the dataset that will be uploaded to HydroShare and used for analysis.
+
+### 8.2) Save Raw Dataset
+
+### 8.3) Save Cleaned Dataset
 
 ```{r}
-# 
-# plots <- map(unique(final_dataset$site), function(site_name) {
-#   ggplot(final_dataset %>% filter(site == site_name), aes(x = DateTime_UTC, y = value_final, color = modifications)) +
-#     geom_point(aes(y = value_raw), color = "gray", alpha = 0.5) + # add raw data points for comparison
-#     geom_point() +
-#     facet_wrap(~parameter, scales = "free_y") +
-#     labs(title = site_name,
-#          x = "Date",
-#          y = "Value",
-#          color = "QC Status")
-# })
-# walk(plots, print)
+year <- "2022"
 
+#check if the folder exists, if not create it
+if (!dir.exists(here( "data/collated/sensor/hydroshare_pub", year))) {
+  dir.create(here( "data/collated/sensor/hydroshare_pub", year), recursive = TRUE)
+}
+
+cleaned_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_cleaned.csv"))
+
+raw_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.csv"))
+
+write_csv(final_dataset, cleaned_file_name)
+
+write_csv(raw_dataset, raw_file_name)
+# Repeat for parquet files
+cleaned_file_name_parquet <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_cleaned.parquet"))
+
+raw_file_name_parquet <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.parquet"))
+
+write_parquet(final_dataset, cleaned_file_name_parquet)
+
+write_parquet(raw_dataset, raw_file_name_parquet)
 ```
-
-
-### Save Data
-
-```{r}
-# year <- "2022"
-# 
-# #check if the folder exists, if not create it
-# if (!dir.exists(here( "data/collated/sensor/hydroshare_pub", year))) {
-#   dir.create(here( "data/collated/sensor/hydroshare_pub", year), recursive = TRUE)
-# }
-# 
-# cleaned_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year, "_cleaned.csv"))
-# 
-# raw_file_name <- here( "data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_", year,"_raw.csv"))
-# 
-# write_csv(final_dataset, cleaned_file_name)
-# 
-# write_csv(raw_dataset, raw_file_name)
-```
-
-## Field Notes
-
-```{r}
-# sensor_field_notes <- grab_mWater_sensor_notes(load_mWater())%>%
-#   filter(year(DT_round) == year & !(site %in% c("springcreek", "boxcreek")))%>%
-#   rename(DateTime_UTC = DT_round) %>%
-#   select(-photos_downloaded,-DT_join, -cal_report_collected, -sensor_swapped_notes, -end_dt, -last_site_visit, -date,-sensor_deployed, -sensor_pulled)%>%
-#   #Clean up crew to just initials and remove any extra text
-#   mutate(crew = crew %>%
-#     str_replace_all("Other \\(please specify\\)", "Other") %>%
-#     str_replace_all("([A-Z])[a-z]+", "\\1") %>%
-#     str_replace_all("(?<=[A-Z])\\s+(?=[A-Z])", "")
-#   )
-# 
-# field_notes_file <- here("data/collated/sensor/hydroshare_pub", year, paste0("CSU_ROSS_sensor_field_notes_", year, ".csv"))
-# 
-# write_csv(sensor_field_notes, field_notes_file)
-
-```
-
-
-
-## Location Metadata
-
-Here we will load and double check the location metadata file created by Sam Struthers and verified by Katie Willi
-
-```{r}
-# location_meta <- read_csv("data/collated/sensor/hydroshare_pub/CSU_ROSS_sonde_location_metadata.csv",
-#                            show_col_types = FALSE)%>%
-#   mutate(data_start_date = as.POSIXct(data_start_date, tz = "UTC", format = "%m/%d/%y"),
-#          data_end_date =  if_else( is.na(data_end_date), 
-#                                    ymd("2025-11-17"),
-#                                    as.POSIXct(data_end_date, tz = "UTC", format = "%m/%d/%y")))%>%
-# 
-#   mutate(min_year = year(data_start_date),
-#          max_year = year(data_end_date), 
-#          year_range = paste0(min_year, "-", max_year))
-# #update as needed
-# #write_csv(location_meta, here("data/collated/sensor/hydroshare_pub/CSU_ROSS_sonde_location_metadata.csv"))
-# 
-# tmap_mode("view")
-# tm_basemap("OpenStreetMap") +
-#   tm_shape(location_meta %>% st_as_sf(coords = c("longitude", "latitude"), crs = 4326)) +
-#   #color is SiteID and shape is year_range
-#   tm_symbols(col = "SiteID", shape = "year_range", size = 0.5, border.col = "black")
-
-```
-
-
-

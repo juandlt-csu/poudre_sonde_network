@@ -12,21 +12,45 @@ ui <- page_navbar(
       fluidRow(
         column(
           width = 12,
-          # 1. Top 2/3rds: Plot spans the entire width
-          card(
-            card_header("Drift Visualization"),
-            card_body(
-              style = "padding: 0;", # Removes internal padding so the plot fills out nicely
-              plotlyOutput("driftPlot", height = "500px") # Gives it a solid, dominating vertical presence
+          # 1. Top row: Plot (left) + Click-to-Set controls (right, above the site/parameter selector below)
+          layout_columns(
+            col_widths = c(9, 3),
+
+            card(
+              card_header("Drift Visualization"),
+              card_body(
+                style = "padding: 0;", # Removes internal padding so the plot fills out nicely
+                plotlyOutput("driftPlot", height = "500px") # Gives it a solid, dominating vertical presence
+              )
+            ),
+
+            card(
+              card_header("Click-to-set Datetimes on Plot"),
+              card_body(
+                uiOutput("click_target_controls"),
+                hr(),
+                actionButton(
+                  "apply_windows",
+                  "Apply Window Updates",
+                  class = "btn-primary",
+                  style = "width: 100%; font-weight: bold;"
+                ),
+                actionButton(
+                  "submit",
+                  "Submit Final Corrections",
+                  class = "btn-success",
+                  style = "width: 100%; font-weight: bold;"
+                )
+              )
             )
           )
         )
       ),
-      # 2. Bottom Row: Split horizontally 10/2
+      # 2. Bottom Row: Split horizontally 9/3 (matches top row widths so columns stay aligned)
       layout_columns(
-        col_widths = c(10, 2),
+        col_widths = c(9, 3),
 
-        # Bottom Left (10): Scrollable window controls
+        # Bottom Left (9): Scrollable window controls
         card(
           card_header("Drift Window Parameter Controls"),
           card_body(
@@ -37,34 +61,22 @@ ui <- page_navbar(
           )
         ),
 
-        # Bottom Right (2): Navigation dropdowns and action buttons
+        # Bottom Right (3): Navigation dropdowns and action buttons
         card(
           card_header("Configuration & Actions"),
           card_body(
-            selectInput("site", "Select Site:",
-                        choices = remaining_site_names,
-                        selected = remaining_site_names[1]),
-            selectInput("parameter", "Select Parameter:", choices = param_choices, selected = param_choices[1]),
             selectizeInput("additional_sites", "Additional Sites:",
                            choices = setdiff(site_choices, remaining_site_names[1]),
                            multiple = TRUE,
                            options = list(maxItems = 2, plugins = "remove_button")),
-            hr(),
-            actionButton(
-              "apply_windows",
-              "Apply Window Updates",
-              class = "btn-primary",
-              style = "width: 100%; font-weight: bold;"
-            ),
-            actionButton(
-              "submit",
-              "Submit Final Corrections",
-              class = "btn-success",
-              style = "width: 100%; font-weight: bold;"
-            )
+            selectInput("site", "Select Site:",
+                        choices = remaining_site_names,
+                        selected = remaining_site_names[1]),
+            selectInput("parameter", "Select Parameter:", choices = param_choices, selected = param_choices[1])
+
           )
         )
       )
     )
-   )
+  )
 )

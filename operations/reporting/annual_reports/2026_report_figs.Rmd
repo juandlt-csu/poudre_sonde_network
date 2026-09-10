@@ -236,7 +236,7 @@ hist_data_clean <- read_parquet(file = "data/collated/sensor/compiled_ross_senso
 
 ```{r}
 
-pull_larimer_precip_q <- function(station_id = "11523",  start_dt = "2025-03-01", end_dt = "2025-06-02"){
+pull_larimer_precip_q <- function(station_id = "11523",  start_dt = "2025-03-01", end_dt = "2026-07-08"){
   
   #format DTs for novastar API
   start_dt <- format(as.POSIXct(start_dt, tz = "MST"), "%Y-%m-%dT%H:%M:%S%z")
@@ -351,15 +351,15 @@ pull_larimer_precip_q <- function(station_id = "11523",  start_dt = "2025-03-01"
 
 ```{r}
 
-if(file.exists(here("data/collated/external_datasets/larimer_county_station_flow_precip_20210101_20251201.parquet"))){
-  larimer_flow_precip <- read_parquet("data/collated/external_datasets/larimer_county_station_flow_precip_20210101_20251201.parquet")%>%
+if(file.exists(here("data/collated/external_datasets/larimer_county_station_flow_precip_20210101_20260601.parquet"))){
+  larimer_flow_precip <- read_parquet("data/collated/external_datasets/larimer_county_station_flow_precip_20210101_20260601.parquet")%>%
     filter(station_id != "11525" & watershed != "out")#this site appears to be an outlier with very high precip values, and is located outside of the watershed boundary, so removing from analysis.
 }else{
   meta <- read_csv("data/raw/external_datasets/larimer_co_precip/larimer_county_station_data.csv", show_col_types = F) %>%
     mutate(site = as.character(numId))%>%
     select(site,name, lat, long, agency, watershed)
   
-  all_data <- map(meta$site, ~pull_larimer_precip_q(station_id = .x, start_dt = "2021-01-01", end_dt = "2025-12-01"))
+  all_data <- map(meta$site, ~pull_larimer_precip_q(station_id = .x, start_dt = "2021-01-01", end_dt = "2026-06-01"))
   
   larimer_flow_precip  <- all_data%>%
     bind_rows()%>%
@@ -538,13 +538,14 @@ create_precip_map <- function(precip_flow_df, date_sel){
   
 }
 #Creating a single map
-create_precip_map(larimer_flow_precip,date_sel =  "2025-08-02")
+create_precip_map(larimer_flow_precip,date_sel =  "2026-06-26")
 #creating a sequence of maps over time
 # dates <- seq(as.Date("2025-08-21"), as.Date("2025-09-01"), by = "day")
 # list_of_maps <- map(dates, ~create_precip_map(precip_flow_df = larimer_flow_precip, date_sel = .x))%>%
 #   #name list   elements by date
 #   setNames(dates)
 
+unique(larimer_flow_precip$parameter)
 ```
 
 ## Load in Flow data from the CLP 
@@ -1088,6 +1089,98 @@ final_plot
 
 ```
 
+#WQ Event - Storm Event
+
+```{r}
+date_range = as.Date(c("2026-06-20", "2026-06-30"))
+
+storm_plot <- function(param){
+  plot_data <- sensor_data_clean%>% 
+    filter(parameter == param)%>%
+    filter(site %in% c("udall", "riverbend", "cottonwood",
+                   "elc", "archery"))%>%
+    filter(between(as.Date(DT_round), date_range[1], date_range[2]))%>%
+    mutate(DT_hourly = floor_date(DT_round, "hour"))%>%
+    summarise(mean = mean(mean, na.rm = TRUE), .by = c("site", "DT_hourly", "parameter"))%>%
+    left_join(labels, by = c( "parameter" = "param"))%>%
+    left_join(site_names, by = "site")
+  
+  plot_data$natural_name <- factor(plot_data$natural_name, levels = site_order)
+  
+  param_label <-chem_expressions[[param]]
+  
+  if(param == "Specific Conductivity"){
+    scales_param = "free_y"
+  }else{
+    scales_param = "free_x"
+  }
+  ggplot(plot_data, aes(x = DT_hourly, y = mean, color = natural_name))+
+    geom_line(linewidth = 1.5, alpha = 1)+
+    scale_color_manual(name = "Site", values = setNames(plot_data$site_color, plot_data$natural_name)) +
+    facet_wrap(~natural_name, scales = scales_param, ncol = 2)+
+    labs(x = "Date", y = param_label, color = "Site", 
+         title = paste0(param, ": Storm Event (6/25/2026)"))+
+    theme_clean(base_size = 16)+
+    theme(legend.position = "right")
+}
+
+plots <- map(unique(sensor_data_clean$parameter), storm_plot)%>%
+  setNames(unique(sensor_data_clean$parameter))
+plots$`Specific Conductivity`
+plots$DO
+plots$Turbidity
+
+ggsave(plot = plots$DO, filename = here(fig_dir, "DO_storm_event.png"), width = 16, height = 10)
+ggsave(plot = plots$Turbidity, filename = here(fig_dir, "Turb_storm_event.png"), width = 16, height = 10)
+ggsave(plot = plots$`Specific Conductivity`, filename = here(fig_dir, "SC_storm_event.png"), width = 16, height = 10)
+
+#combined plot
+date_range <- as.Date(c("2026-06-20", "2026-06-30"))
+
+params_to_plot <- c("Specific Conductivity", "DO", "Turbidity")
+
+combined_data <- sensor_data_clean %>%
+  filter(parameter %in% params_to_plot) %>%
+  filter(site %in% c("salyer", "riverbend", "elc", "archery")) %>%
+  filter(between(as.Date(DT_round), date_range[1], date_range[2])) %>%
+  mutate(DT_hourly = floor_date(DT_round, "hour")) %>%
+  summarise(mean = mean(mean, na.rm = TRUE), 
+            .by = c("site", "DT_hourly", "parameter")) %>%
+  left_join(labels, by = c("parameter" = "param")) %>%
+  left_join(site_names, by = "site")
+
+combined_data$natural_name <- factor(combined_data$natural_name, levels = site_order)
+combined_data$parameter <- factor(combined_data$parameter, levels = params_to_plot)
+
+param_labeller <- as_labeller(function(x) sapply(x, function(p) chem_expressions[[p]]),
+                               default = label_parsed)
+
+combined_plot <- ggplot(combined_data, aes(x = DT_hourly, y = mean, color = natural_name)) +
+  geom_line(linewidth = 1.2, alpha = 1) +
+  scale_color_manual(name = "Site", 
+                      values = setNames(combined_data$site_color, combined_data$natural_name)) +
+  facet_grid(parameter ~ natural_name, scales = "free_y", 
+             switch = "y",
+             labeller = labeller(parameter = param_labeller)) +
+  labs(x = "Date", y = NULL, color = "Site",
+       title = "Storm Event (6/25/2026)") +
+  theme_clean(base_size = 15) +
+  theme(legend.position = "none",
+        strip.text.y.left = element_text(face = "bold", size = 9, angle = 90),
+        strip.text.x = element_text(face = "bold"),
+        strip.placement = "outside",
+        strip.background.y = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"))
+
+combined_plot
+
+ggsave(plot = combined_plot, filename = here(fig_dir, "storm_event_combined.png"), width = 16, height = 10)
+
+```
+
+
 # WQ Monthly Summary
 
 ## Function for monthly boxplots
@@ -1478,6 +1571,104 @@ final_plot <- temp_v_air_temp + do_vs_air_temp+
   theme(legend.position = "bottom")
 
 ggsave(here(fig_dir, "temp_do_vs_air_temp.png"),plot = final_plot, width = 18, height = 10, units = "in", dpi = 300)
+```
+
+# Current WY flow analysis vs historic min/max
+
+```{r}
+library(cdssr)
+library(jsonlite)
+
+#using CDWR lincoln, boxelder, and fossil creek gauges
+
+gauges <- c("CLAFORCO", "CLABOXCO", "CLARIVCO")
+
+gauge_labels <- c(
+  CLAFORCO = "Lincoln",
+  CLABOXCO = "Boxelder",
+  CLARIVCO = "Poudre River Below Fossil Creek")
+
+wy_start   <- as.Date("2025-10-01")
+today_date <- Sys.Date()
+
+# Pull daily discharge from CDWR for a station over a date range
+get_dwr_daily <- function(abbrev, start_date, end_date){
+  url <- paste0(
+    "https://dwr.state.co.us/Rest/GET/api/v2/telemetrystations/telemetrytimeseriesday/",
+    "?format=json",
+    "&abbrev=", abbrev,
+    "&parameter=DISCHRG",
+    "&startDate=", format(start_date, "%m/%d/%Y"),
+    "&endDate=", format(end_date, "%m/%d/%Y")
+  )
+  resp <- GET(url)
+  dat <- fromJSON(content(resp, "text", encoding = "UTF-8"))$ResultList
+  
+  if(is.null(dat) || length(dat) == 0) return(NULL)
+  
+  dat %>%
+    mutate(
+      abbrev = abbrev,
+      measDate = as.Date(measDate)
+    )
+}
+
+#historic data
+hist_raw <- map_df(gauges, ~get_telemetry_ts(abbrev = .x, 
+                                             parameter = "DISCHRG", 
+                                             start_date = ("2000-01-01"), 
+                                             end_date = format(today_date, "%Y-%m-%d"),
+                                             timescale = "day"))
+hist_raw <- hist_raw %>%
+  mutate(
+    abbrev = factor(abbrev, levels = gauges),
+    water_year = if_else(month(meas_date) >= 10, year(meas_date) + 1, year(meas_date)),
+    plot_year  = if_else(month(meas_date) >= 10, 2025, 2026),
+    plot_date  = as.Date(paste0(plot_year, "-", month(meas_date), "-", day(meas_date)),
+                          format = "%Y-%m-%d")
+  ) %>%
+  filter(!is.na(plot_date))
+
+hist_stats <- hist_raw %>%
+  filter(water_year != 2026) %>%
+  summarise(
+    median = median(.data$meas_value, na.rm = TRUE),
+    min    = min(.data$meas_value, na.rm = TRUE),
+    max    = max(.data$meas_value, na.rm = TRUE),
+    .by = c("abbrev", "plot_date")
+  )
+
+#current wy data
+current_wy <- hist_raw %>%
+  filter(water_year == 2026) %>%
+  select(abbrev, meas_date, plot_date, meas_value)
+
+today_plot_date <- current_wy %>% pull(plot_date) %>% max(na.rm = TRUE)
+
+WY_flow_plot <- ggplot(hist_stats, aes(x = plot_date, y = median, color = abbrev)) +
+  geom_line(alpha = 0.7, linetype = "dashed") +
+  geom_ribbon(aes(ymin = min, ymax = max), color = "grey", alpha = 0.2) +
+  geom_line(data = current_wy, aes(x = plot_date, y = meas_value, color = abbrev),
+            linewidth = 1.5, alpha = 1) +
+  scale_x_date(limits = c(wy_start, today_plot_date), date_labels = "%b") +
+  scale_y_log10()+
+  facet_wrap(~abbrev, scales = "free_y", ncol = 1,
+             labeller = labeller(abbrev = gauge_labels)) +
+  labs(
+    x = "Date", y = "Discharge (cfs)", color = "Gauge",
+    title = "2026 WY Flow vs Historical Min/Max",
+    subtitle = "Dashed line = historical daily median; grey ribbon = historical daily min/max range"
+  ) +
+  theme_clean(base_size = 15) +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 10),
+        axis.title.x = element_text(face = "bold"),
+        axis.title.y = element_text(face = "bold"))
+
+WY_flow_plot
+
+ggsave(plot = WY_flow_plot, filename = here(fig_dir, "WY_flow_plot.png"), width = 16, height = 10)
+
 ```
 
 

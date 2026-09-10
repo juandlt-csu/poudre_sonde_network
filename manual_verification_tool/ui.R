@@ -24,168 +24,129 @@ ui <- page_navbar(
   #### Tab 2: Data Verification ####
   nav_panel(
     title = "Data Verification",
-    layout_columns(
-      col_widths = c(8,4),
+    layout_sidebar(
+      sidebar = sidebar(
+        width = 350,
 
-      #### Left column ####
-      layout_columns(
-        col_widths = 12,
-        # Main plot (top left)
-         card(
-        #   card_header(
-        #     div(
-        #       actionButton("prev_tab", "← Back to Selection", class = "btn-info"),
-        #       keys::useKeys(),
-        #       keys::keysInput("q_key", "q"),
-        #       actionButton("quit_app", "Quit", class = "btn-danger")
-        #     )
-        #   ),
+        # Navigation
+        div(
+          class = "d-flex justify-content-between align-items-center mb-3",
+          actionButton("prev_week", "← Prev", class = "btn-secondary btn-sm"),
+          actionButton("reset_week", "Reset", class = "btn-danger btn-sm"),
+          actionButton("next_week", "Next →", class = "btn-secondary btn-sm")
+        ),
+        div(
+          class = "d-flex justify-content-between align-items-center mb-3",
+          keys::useKeys(),
+          keys::keysInput("q_key", "q"),
+          actionButton("quit_app", "Quit", class = "btn-danger btn-sm w-100")
+        ),
+
+        # Weekly Decision
+        card(
+          card_header(h6("Weekly Decision", class = "m-0")),
           card_body(
-            plotOutput("main_plot",
-                       brush = brushOpts(
-                         id = "plot_brush",
-                         resetOnNew = FALSE  # This allows multiple brush selections
-                       ))
-          ),
-          card_footer(
-            div(
-              class = "d-flex justify-content-between gap-3", # Use space-between instead of evenly
-              class = "d-flex gap-3",
-              selectizeInput("add_sites", "Additional Sites:",
-                             choices = available_sites,
-                             multiple = TRUE,
-                             options = list(plugins = "remove_button"),
-                             width = "300px"),
-              div(
-                class = "d-flex flex-column gap-2",
-                materialSwitch(
-                  inputId = "remove_omit",
-                  label = "Remove Omit",
-                  value = FALSE,
-                  width = "200px",
-                  status = "success"
-                ),
-                materialSwitch(
-                  inputId = "remove_flag",
-                  label = "Remove Flag",
-                  value = FALSE,
-                  width = "200px",
-                  status = "success"
-                ),
-                materialSwitch(
-                  inputId = "add_line",
-                  label = "Plot Line",
-                  value = FALSE,
-                  width = "200px",
-                  status = "success"
-                )
-              ),
-              div(
-                class = "d-flex flex-column gap-2",
-                materialSwitch(
-                  inputId = "incl_thresholds",
-                  label = "Thresholds",
-                  value = FALSE,
-                  width = "200px",
-                  status = "success"
-                ),
-                materialSwitch(
-                  inputId = "plot_log10",
-                  label = "Log 10",
-                  value = FALSE,
-                  width = "200px",
-                  status = "success"
-                ),
-                materialSwitch(
-                  inputId = "incl_ex_days",
-                  label = "Extra Data",
-                  value = TRUE,
-                  width = "200px",
-                  status = "success"
-                )
-              ),
-              actionButton("prev_week","← Previous Week", class = "btn-secondary", style = "width: 200px;"),
-              actionButton("next_week","Next Week →", class = "btn-secondary", style = "width: 200px;"),
-              actionButton("reset_week", "Reset Data", class = "btn-danger"),
-              keys::useKeys(),
-                     keys::keysInput("q_key", "q"),
-                     actionButton("quit_app", "Quit", class = "btn-danger")
-            )
+            class = "p-2",
+            uiOutput("weekly_decision_radio"),
+            uiOutput("submit_decision_ui")
           )
         ),
 
-        #### Weekly decision card (bottom left, shorter height) ####
+        # Data Brush Tools
         card(
-          style = "height: 5px; overflow: hidden;",
-          # card_header(
-          #   h6("Make weekly decision")
-          # ),
+          card_header(h6("Brush Actions", class = "m-0")),
           card_body(
-            div(
-              div(
-                class = "d-flex gap-5", # Add flexbox with gap between elements
-                div(
-                  uiOutput("weekly_decision_radio")
-                )
-              ),
-              uiOutput("submit_decision_ui")
-            )
-          )
-        )
-
-        #### end Weekly decision card ####
-      ),
-
-      #### Right column ####
-      layout_columns(
-        col_widths = 12,
-        # Sub plots card (top right)
-        card(
-          card_header(
-            h6("Additional Parameters")
-          ),
-          card_body(
-            # Sub parameter selection
-            selectizeInput("sub_parameters", "Select Parameters:",
-                           choices = available_parameters,
-                           multiple = TRUE,
-                           options = list(plugins = "remove_button")),
-            selectizeInput("sub_sites", "Select Sites:",
-                           choices = available_sites,
-                           multiple = TRUE,
-                           options = list(plugins = "remove_button")),
-            div(
-              style = "height: 600px; overflow-y: auto;",  # Make this div scrollable
-              plotlyOutput("sub_plots", width = "100%", height = "100%")
-            )
-
-
-          )
-        ),
-        # Data selection card (bottom right)
-        card(
-          card_header(
-            h6("Data Brush")
-          ),
-          card_body(
-            div(
-              class = "d-flex align-items-center gap-5",
-              radioButtons("brush_action",
-                           "Select Action:",
-                           choices = c("Accept" = "A",
-                                       "Flag" = "F",
-                                       "Omit" = "O"),
-                           selected = character(0),
-                           inline = TRUE),  # This makes the radio buttons horizontal
-              actionButton("clear_brushes", "Clear Brushes")
-            ),
-            selectizeInput("user_brush_flags", "Select Flags:",
+            class = "p-2",
+            selectizeInput("user_brush_flags", "Select Flag(s):",
                            choices = available_flags,
                            multiple = TRUE,
                            options = list(plugins = "remove_button")),
+            div(
+              class = "d-flex flex-column gap-2",
+              actionButton("btn_accept_brush", "Accept Selection", class = "btn-success btn-sm"),
+              actionButton("btn_flag_brush", "Flag Selection", class = "btn-warning btn-sm"),
+              actionButton("btn_omit_brush", "Omit Selection", class = "btn-danger btn-sm"),
+              actionButton("clear_brushes", "Clear Brush", class = "btn-secondary btn-sm mt-2")
+            )
+          )
+        ),
 
-            # Conditional submit button
-            uiOutput("brush_submit_ui")
+        # Additional Sites
+        card(
+          card_header(h6("Additional Sites", class = "m-0")),
+          card_body(
+            class = "p-2",
+            selectizeInput("add_sites", label = NULL,
+                           choices = available_sites,
+                           multiple = TRUE,
+                           options = list(plugins = "remove_button"),
+                           width = "100%")
+          )
+        ),
+
+        # Plot Options
+        card(
+          card_header(h6("Plot Options", class = "m-0")),
+          card_body(
+            class = "p-2",
+            checkboxGroupInput("plot_options", label = NULL,
+                               choices = c("Remove Omit" = "remove_omit",
+                                           "Remove Flag" = "remove_flag",
+                                           "Plot Line" = "add_line",
+                                           "Thresholds" = "incl_thresholds",
+                                           "Log 10" = "plot_log10",
+                                           "Extra Data" = "incl_ex_days",
+                                           "Show Legend" = "show_legend"),
+                               selected = c("incl_ex_days", "show_legend",
+                                            "add_line", "remove_omit"))
+          )
+        )
+      ), # end sidebar
+
+      # Main layout for plots
+      layout_columns(
+        col_widths = c(8, 4),
+
+        # Main plot card
+        card(
+          full_screen = TRUE,
+          card_body(
+            plotOutput("main_plot",
+                       height = "100%",
+                       brush = brushOpts(
+                         id = "plot_brush",
+                         resetOnNew = TRUE  # Simplified: immediate actions
+                       ))
+          )
+        ),
+
+        # Sub plots card
+        navset_card_tab(
+          id = "additional_tabs",
+          nav_panel("Plots",
+            layout_columns(
+              col_widths = c(6, 6),
+              selectizeInput("sub_parameters", "Select Parameters:",
+                             choices = available_parameters,
+                             multiple = TRUE,
+                             options = list(plugins = "remove_button")),
+              selectizeInput("sub_sites", "Select Sites:",
+                             choices = available_sites,
+                             multiple = TRUE,
+                             options = list(plugins = "remove_button"))
+            ),
+            div(
+              class = "flex-fill d-flex flex-column",
+              style = "overflow-y: auto; min-height: 600px;",
+              plotlyOutput("sub_plots", width = "100%", height = "100%")
+            )
+          ),
+          nav_panel("Field Notes",
+            div(
+              class = "flex-fill d-flex flex-column",
+              style = "overflow-y: auto; min-height: 600px;",
+              DT::dataTableOutput("field_notes_table")
+            )
           )
         )
       )
@@ -236,4 +197,3 @@ ui <- page_navbar(
   )
 
 )
-

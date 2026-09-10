@@ -36,19 +36,21 @@ invisible(
   })
 )
 
+# EDIT: Year and cycle values set in the Process_2022.rmd
+# This prevents the app from needing to be updated every year when new data is added
 ####---- SET YEAR -----###
-year = "2020"
-year_cycle = paste0( year, "_cycle")
+# year = "2022"
+# year_cycle = paste0( year, "_cycle")
 #### ----------------- ###
 
-in_progress_dir = here::here("data/raw/sensor/manual_data_verification", year_cycle, "in_progress")
+in_progress_dir = in_progress_path
 
 #Check to see if post verification folder exists
-post_ver_dir = here("data/raw/sensor/manual_data_verification/", year_cycle, "post_verification")
+post_ver_dir = file.path(year_cycle_path, "post_verification")
 if(!dir.exists(post_ver_dir)){
   dir.create(post_ver_dir)
 }
-excel_path <- here(post_ver_dir, "drift_corrections.xlsx")
+excel_path <- file.path(post_ver_dir, "drift_corrections.xlsx")
 
 # Template to find downstream and upstream data
 site_order <- list(
@@ -62,14 +64,14 @@ site_order <- list(
 
 # Load source scripts containing the functions from your RMD
 source("R/drift_functions.R")
-field_notes <- grab_mWater_sensor_notes(load_mWater())
+field_notes <- grab_mWater_sensor_notes(load_mWater(creds = yaml::read_yaml(here::here("creds", "mWaterCreds.yml"))))
 
 # Load data
-verified_files <- list.files(here(in_progress_dir, "verified_directory"),
+verified_files <- list.files(file.path(in_progress_dir, "verified_directory"),
                              pattern = "Turbidity|FDOM", ignore.case = TRUE, full.names = TRUE)
 ver_site_params <- str_remove(basename(verified_files), "_FINAL_.*\\.parquet$")
 #Post Verified files
-post_ver_files <- list.files(here(post_ver_dir),
+post_ver_files <- list.files(post_ver_dir,
                              pattern = "Turbidity|FDOM", ignore.case = TRUE, full.names = TRUE)
 post_ver_site_params <- str_remove(basename(post_ver_files), ".parquet$")
 

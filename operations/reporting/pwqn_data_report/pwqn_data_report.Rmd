@@ -1,0 +1,492 @@
+---
+title: "Poudre Water Quality Network Data Availability Report"
+author: "Maggie Rouin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# set up
+
+## load packages
+```{r, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.dim = c(12,10))
+# loading packages
+package_loader <- function(x) {
+  if (x %in% installed.packages()) {
+    suppressMessages({
+      library(x, character.only = TRUE)
+    })
+  } else {
+    suppressMessages({
+      install.packages(x)
+      library(x, character.only = TRUE)
+    })
+  }
+}
+
+invisible(
+  lapply(c("arrow",
+           "data.table",
+           "httr",
+           "httr2",
+           "tidyverse",
+           "lubridate",
+           "zoo",
+           "padr",
+           "stats",
+           "RcppRoll",
+           "yaml",
+           "ross.wq.tools",
+           "here",
+           "furrr", 
+           "dataRetrieval", 
+           "cdssr", 
+           "ggplot2", 
+           "ggthemes", 
+           "patchwork",
+           "sf", 
+           "plotly",
+           "viridisLite",
+           "tmap",
+           "knitr",
+           "flextable",
+           "DT"
+  ),
+  package_loader)
+)
+
+`%nin%` = Negate(`%in%`)
+```
+
+
+## sites, parameters, and plots
+```{r, include = FALSE}
+if ({
+  require(systemfonts)
+  ("Roboto" %in% system_fonts()$family)
+}) {
+  ROSS_theme <- theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = 'bold', family = "Roboto"),
+          plot.subtitle = element_text(hjust = 0.5, family = "Roboto"))
+} else {
+  message("You do not have the Roboto font family installed on your computer, currenly using ggplot default text family.
+          See ROSS_themes.R for directions to install the font family on your computer.")
+  ROSS_theme <- theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5, face = 'bold'),
+          plot.subtitle = element_text(hjust = 0.5))
+}
+
+
+#Site names
+site_names <- tibble(site = c("pbd", "bellvue", "salyer", "udall", "riverbend", "cottonwood" ,"elc",  "archery", "riverbluffs"), 
+                     site_name = c("Canyon Mouth", "Tamasag", "Legacy", "Lincoln", "Timberline", "Prospect" ,"Boxelder",  "Archery", "River Bluffs"), 
+                     site_color = c( "#000000" , "#185BB4","#009DD1","#00F5DC", "#00F0C0", "#00D684", "#00BD48",  "#00DB58", "#0FFF6B" ) )
+
+#Site Order from up to downstream
+
+site_order = c("Canyon Mouth", "Bellvue", "Salyer", "Udall", "Riverbend", "Cottonwood", "ELC", "Archery", "River Bluffs")
+
+
+#ROSS Colors
+
+ROSS_lt_pal <- c("#002EA3", "#E70870", "#256BF5",
+                 "#745CFB", "#1E4D2B", "#56104E")
+
+ROSS_dk_pal <- c("#1E4D2B", "#E70870", "#256BF5",
+                 "#FFCA3A", "#745CFB", "#C3F73A")
+
+ROSS_acc_pal <- c("#56104E", "#745CFB", "#FFCA3A", "#1E4D2B")
+
+# Parameter labels
+labels <- tibble(param = c("Turbidity", "Specific Conductivity", "Depth", "Chl-a Fluorescence", "FDOM Fluorescence", "Temperature", "DO", 'pH', "Flow"),
+                 label = c("Turbidity (NTU)", "Specific Conductivity (uS/cm)", "Depth (ft)", "Chl-a Fluorescence (RFU)", "FDOM Fluorescence (RFU)", "Temperature (C)", "DO (mg/L)", 'pH', "Flow (cfs)"))
+
+
+chem_expressions <- list(
+  "Turbidity" = expression(Turbidity ~ (NTU)),
+  "Chl-a Fluoresence"      = expression(Chl-a ~ Fluoresence ~ (RFU)),
+  "FDOM Fluoresence"      = expression(FDOM ~ Fluoresence ~ (RFU)),
+  "Specific Conductivity" = expression(Specific ~ Conductivity ~ (mu ~ S ~ cm^{-1})),
+  "Depth"      = expression(Depth ~ (ft)),
+  "Temperature" = expression(Temperature ~ (degree ~ C)),
+  "DO"        = expression(DO ~ (mg ~ L^{-1})),
+  "Flow"      = expression(Flow ~ (cfs)),
+  "pH"        = expression(pH)
+)
+
+
+params <- paste(labels$param, collapse = "|")
+
+```
+
+
+## read in data
+```{r, include = FALSE}
+all_data <- list.files(
+  "operations/reporting/pwqn_data_report/data/hydroshare_pub",
+  pattern = "^CSU_ROSS_\\d{4}_cleaned\\.csv$",
+  full.names = TRUE,
+  recursive = TRUE) |> 
+  map(~ read_csv(.x, show_col_types = FALSE)) |> 
+  list_rbind()
+
+pwqn_data <- all_data |>
+  filter(value_final != "NA") |> 
+  mutate(DateTime_UTC = with_tz(DateTime_UTC, tz = "MST")) |> 
+  rename(DateTime_MT = DateTime_UTC) |> 
+  mutate(
+    year = year(DateTime_MT),
+    month = month(DateTime_MT),
+    year_month = floor_date(DateTime_MT, unit = "month")) |> 
+  left_join(labels, by = c( "parameter" = "param")) |> 
+  left_join(site_names, by = "site") |> 
+  filter(!is.na(site_name))
+
+pwqn_data_clean <- pwqn_data |>
+  distinct(DateTime_MT, site_name, parameter, .keep_all = TRUE)
+
+print(paste("Original records:", nrow(pwqn_data)))
+print(paste("Records after removing duplicates:", nrow(pwqn_data_clean)))
+print(paste("Duplicates removed:", nrow(pwqn_data) - nrow(pwqn_data_clean)))
+
+check_duplicates <- pwqn_data_clean |>
+  group_by(DateTime_MT, site_name, parameter) |>
+  filter(n() > 1)
+
+print(paste("Duplicates remaining:", nrow(check_duplicates)))
+
+counts <- pwqn_data_clean |> 
+  count(site = "archery", parameter = "pH", month = 2)
+
+```
+
+
+# Graphs
+```{r echo=FALSE, fig.width=30, fig.height=30, out.width="100%"}
+site_order <- site_names$site_name
+
+#yearly
+yearly_percent <- pwqn_data_clean |> 
+  left_join(site_names, by = "site_name") |>
+  group_by(year, parameter, site_name) |>
+  summarise(actual_records = n(),
+    .groups = 'drop') |> 
+  mutate(expected_records = if_else(
+      leap_year(year),
+      366 * 24 * 60 / 15,
+      365 * 24 * 60 / 15),
+    data_pct = (actual_records / expected_records) * 100,
+    site_name = factor(site_name, levels = site_order)) |> 
+  arrange(year)
+
+yearly_plot <- yearly_percent |> 
+  ggplot(aes(x = factor(year), y = data_pct, fill = site_name)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2) +
+  scale_fill_manual(
+    name = "Site",
+    values = setNames(site_names$site_color, site_names$site_name)
+  ) +
+  labs(title = "Data Availability by Year",
+    x = "Year",
+    y = "Availability (%)",
+    fill = "Site") +
+  ylim(0, 105)
+
+yearly_plot
+
+#monthly
+monthly_percent <- pwqn_data_clean |> 
+  mutate(month = month(DateTime_MT),
+         year = year(DateTime_MT)) |> 
+  group_by(year, month, parameter, site_name) |>
+  summarise(actual_records = n(),
+    .groups = 'drop') |> 
+  mutate(days_in_month = case_when(
+      month == 2 ~ if_else(year %in% c(2020, 2024), 29, 28),
+      month %in% c(4, 6, 9, 11) ~ 30, TRUE ~ 31),
+    expected_records = days_in_month * 24 * 60 / 15,
+    data_pct = (actual_records / expected_records) * 100) |>
+  left_join(site_names, by = "site_name") |>
+  mutate(month_year = ym(paste(year, month, sep = "-")),
+    site_name = factor(site_name, levels = site_order)) |> 
+  arrange(month, month_year, parameter, site_name)
+
+monthly_plot <- monthly_percent |> 
+  ggplot(aes(x = month_year, y = data_pct, fill = site_name)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 2) +
+  scale_fill_manual(name = "Site",
+    values = setNames(site_names$site_color, site_names$site_name)) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "4 months") +
+  labs(title = "Monthly Data Availability",
+    x = "Month-Year",
+    y = "Availability (%)",
+    fill = "Site") +
+  ylim(0, 105) +
+  theme(axis.text.x = element_text(angle = 90))
+
+monthly_plot
+```
+These plots depict the yearly and monthly data availability percentages for each parameter across all sites. As the years progress, the data availability increases across all parameters.
+
+# Heatmaps
+```{r echo=FALSE, fig.width=30, fig.height=50, out.width="100%"}
+#all data heatmap
+combined_monthly <- monthly_percent |> 
+  mutate(fake_date = ymd(paste(year, month, "01", sep = "-"))) |> 
+  ggplot(aes(x = fake_date, y = site_name, fill = data_pct)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient(low = "red", high = "green", limits = c(0, 100)) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "6 months") +
+  facet_wrap(~parameter, scales = "free_y", ncol = 1) +
+  labs(title = "Data Availability",
+       x = "Month",
+       y = "Site",
+       fill = "Availability (%)")
+
+print(combined_monthly)
+
+```
+This heatmap depicts the data availability at each site across the data collection timeframe (March 2019- November 2025). Yearly data availability is highest in 2024 and 2025 and monthly data availability is highest in the late summer months. 
+
+# Timeseries
+```{r echo=FALSE, fig.width=30, fig.height=30, out.width="100%"}
+#monthly boxplots
+param_units <- pwqn_data_clean |>
+  select(parameter, units) |>
+  distinct() |>
+  mutate(axis_label = paste0(parameter, " (", units, ")")) |>
+  pull(axis_label, name = parameter)
+
+facet_labeler <- labeller(parameter = param_units)
+
+log_params <- c("Turbidity", "Specific Conductivity", "Chl-a Fluorescence")
+
+pwqn_data_clean <- pwqn_data_clean |>
+  mutate(site_name = factor(site_name, levels = site_order))
+
+p_log <- pwqn_data_clean |>
+  filter(parameter %in% log_params, value_final > 0) |>
+  ggplot(aes(x = factor(year), y = value_final, fill = site_name)) +
+  geom_boxplot(size = 0.25, width = 0.6, position = position_dodge(width = 0.75), outlier.size = 0.5) +
+  facet_wrap(~parameter, scales = "free_y", labeller = facet_labeler, ncol = 1) +
+  scale_y_log10() +
+  scale_fill_manual(values = colorRampPalette(c("darkgreen", "lightblue"))(n_distinct(pwqn_data_clean$site_name))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1), 
+        axis.title.x = element_text(margin = margin(t = 15)), axis.title.y = element_blank()) +
+  labs(x = "Year",
+       fill = "Site Name")
+
+p_linear <- pwqn_data_clean |>
+  filter(!parameter %in% log_params) |>
+  ggplot(aes(x = factor(year), y = value_final, fill = site_name)) +
+  geom_boxplot(size = 0.25, width = 0.6, position = position_dodge(width = 0.75), outlier.size = 0.5) +
+  facet_wrap(~parameter, scales = "free_y", labeller = facet_labeler, ncol = 1) +
+  scale_fill_manual(values = colorRampPalette(c("darkgreen", "lightblue"))(n_distinct(pwqn_data_clean$site_name))) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.x = element_blank(), 
+        legend.title = element_blank(), legend.position = "none") +
+  labs(title = "Yearly Parameter Averages by Site (upstream to downstream)")
+
+combined_plot <- (p_linear / p_log) +
+  plot_layout(heights = c(2, 1), guides = "collect") +
+  theme(legend.position = "right")
+
+combined_plot <- wrap_elements(combined_plot) +
+  labs(tag = "Value") +
+  theme(plot.tag = element_text(size = 11, angle = 90),
+        plot.tag.position = "left")
+
+combined_plot
+```
+This boxplot depicts the average values of each parameter across the sites in the PWQN, from upstream to downstream. The boxplot indicates that averages for pH, temperature, chl-a flourescence, and specific conductivity increase as you move downstream in the network. There is also a slight decrease in dissolved oxygen averages in the downstream sites.
+
+
+# Historic Range
+```{r echo=FALSE, fig.width=30, fig.height=30, out.width="100%"}
+#bands
+pct_bands <- list(
+  list(ymin = "p0",  ymax = "p5",   label = "Extreme (<5% / >95%)",              color = "#8E857A"),
+  list(ymin = "p5",  ymax = "p10",  label = "Much below/above (5-10% / 90-95%)", color = "#E8DAB2"),
+  list(ymin = "p10", ymax = "p25",  label = "Below/above normal (10-25% / 75-90%)", color = "#F0F7EB"),
+  list(ymin = "p25", ymax = "p75",  label = "Normal range (25-75%)",             color = "#9CC4DE"),
+  list(ymin = "p75", ymax = "p90",  label = "Below/above normal (10-25% / 75-90%)", color = "#F0F7EB"),
+  list(ymin = "p90", ymax = "p95",  label = "Much below/above (5-10% / 90-95%)", color = "#E8DAB2"),
+  list(ymin = "p95", ymax = "p100", label = "Extreme (<5% / >95%)",              color = "#8E857A")
+)
+
+band_colors <- setNames(
+  vapply(pct_bands, `[[`, "", "color"),
+  vapply(pct_bands, `[[`, "", "label")
+)[!duplicated(vapply(pct_bands, `[[`, "", "label"))]
+
+#daily summary function
+daily_summary <- function(x) {
+  q <- quantile(x, probs = c(0, .05, .10, .25, .75, .90, .95, 1), na.rm = TRUE)
+  tibble(p0 = q[1], p5 = q[2], p10 = q[3], p25 = q[4],
+         p75 = q[5], p90 = q[6], p95 = q[7], p100 = q[8],
+         Mean = mean(x, na.rm = TRUE))
+}
+
+#remove legend duplicates
+updated_legend <- function(p) {
+  seen <- character(0)
+  for (i in seq_along(p$x$data)) {
+    nm <- p$x$data[[i]]$name
+    if (is.null(nm)) next
+    
+    # strip wrapping "(" ")" and trailing ",<number>" that ggplotly adds per facet panel
+    clean_nm <- sub("^\\((.*),\\d+\\)$", "\\1", nm)
+    
+    if (clean_nm %in% seen) {
+      p$x$data[[i]]$showlegend <- FALSE
+    } else {
+      seen <- c(seen, clean_nm)
+      p$x$data[[i]]$name <- clean_nm   # restore clean label for the one that's shown
+    }
+  }
+  p
+}
+
+#temps plot
+historic_temps_all_sites <- function(data = pwqn_data_clean,
+                                      plot_title = "Historical Water Temperature by Site",
+                                      sites = c("Canyon Mouth", "Tamasag", "Legacy", "Lincoln",
+                                                "Timberline", "Prospect", "Boxelder", "Archery", "River Bluffs"),
+                                      incl_winter = FALSE,
+                                      temp_param_name = "Temperature") {
+
+  temp_df <- data |>
+    filter((site_name %in% sites | site %in% sites),
+           grepl(temp_param_name, parameter, ignore.case = TRUE))
+  if (nrow(temp_df) == 0) stop("No temperature data found for the specified sites.")
+
+  temp_data <- temp_df |>
+    mutate(datetime = as.Date(DateTime_MT),
+           month_day = format(datetime, "%m-%d"),
+           value = value_final) |>
+    filter(!is.na(value))
+  if (!incl_winter) temp_data <- filter(temp_data, !month(datetime) %in% c(12, 1, 2))
+
+  ref_year <- 2000
+  daily_stats <- temp_data |>
+    group_by(site_name, month_day) |>
+    reframe(daily_summary(value)) |>
+    mutate(plot_date = as.Date(paste0(ref_year, "-", month_day), "%Y-%m-%d")) |>
+    filter(!is.na(plot_date)) |>
+    arrange(site_name, plot_date) |>
+    mutate(site_name = factor(site_name, levels = sites))
+
+  ribbon_layers <- lapply(pct_bands, function(b) {
+    geom_ribbon(aes(ymin = .data[[b$ymin]], ymax = .data[[b$ymax]], fill = b$label))
+  })
+
+  p <- ggplot(daily_stats, aes(x = plot_date)) +
+    ribbon_layers +
+    geom_line(aes(y = Mean, color = "Daily Average (Mean)"), linewidth = 0.5) +
+    facet_wrap(~site_name, ncol = 1, scales = "fixed") +
+    scale_fill_manual(name = "Percentile Range", values = band_colors, breaks = names(band_colors)) +
+    scale_color_manual(name = "", values = c("Daily Average (Mean)" = "#222222")) +
+    scale_x_date(date_labels = "%b", date_breaks = "2 months") +
+    labs(title = plot_title, x = "", y = "Temperature (°C)") +
+    theme_bw() +
+    theme(legend.position = "bottom",
+          strip.background = element_rect(fill = "grey90"),
+          strip.text = element_text(face = "bold"),
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+  gp <- ggplotly(p)
+  updated_legend(gp)
+}
+
+all_sites_temp_plot2 <- historic_temps_all_sites(pwqn_data_clean)
+all_sites_temp_plot2
+
+```
+The timeseries plot shows the historical water temperatures at each site across the year.
+
+# Interactive Tables
+```{r echo=FALSE, fig.width=30, fig.height=30, out.width="100%"}
+#yearly
+format_availability_dt <- function(data, col_names, align_vec) {
+  n_cols <- ncol(data)
+  center_cols <- which(align_vec == "c") - 1
+  datatable(
+    data,
+    colnames = col_names,
+    rownames = FALSE,
+    filter = "top",
+    extensions = "Buttons",
+    options = list(
+      pageLength = 25,
+      lengthMenu = c(10, 25, 50, 100),
+      dom = 'Blfrtip',
+      buttons = c('copy', 'csv', 'excel'),
+      columnDefs = list(
+        list(className = 'dt-center', targets = center_cols)),
+      initComplete = JS("function(settings, json) {",
+        "$(this.api().table().header()).css({'background-color': 'darkblue', 'color': 'white', 
+        'font-weight': 'bold'});","}")),
+    class = "stripe hover compact")
+}
+
+yearly_data_table_site <- yearly_percent |>
+  group_by(year, parameter, site_name) |>
+  summarise(
+    avg_availability = round(mean(data_pct, na.rm = TRUE), 2),
+    .groups = 'drop') |>
+  mutate(year = sprintf("%d", year))
+
+yearly_site_dt <- format_availability_dt(
+  yearly_data_table_site,
+  col_names = c("Year", "Parameter", "Site", "Average Availability (%)"),
+  align_vec = c("l", "l", "l", "c"))
+
+yearly_site_dt
+
+yearly_data_table <- yearly_percent |>
+  group_by(year, parameter) |>
+  summarise(
+    avg_availability = round(mean(data_pct, na.rm = TRUE), 2),
+    .groups = 'drop') |>
+  mutate(year = sprintf("%d", year))
+
+yearly_dt <- format_availability_dt(
+  yearly_data_table,
+  col_names = c("Year", "Parameter", "Average Availability (%)"),
+  align_vec = c("l", "l", "c"))
+
+yearly_dt
+
+# monthly
+monthly_table_site <- monthly_percent |>
+  mutate(month_name = factor(month.name[month], levels = month.name)) |> 
+  group_by(month_name, parameter, site_name) |>
+  summarise(
+    avg_availability = round(mean(data_pct, na.rm = TRUE), 2),
+    .groups = 'drop')
+
+monthly_site_dt <- format_availability_dt(
+  monthly_table_site,
+  col_names = c("Month", "Parameter", "Site", "Average Availability (%)"),
+  align_vec = c("l", "l", "l", "c"))
+
+monthly_site_dt
+
+monthly_data_table <- monthly_percent |>
+  mutate(month_name = factor(month.name[month], levels = month.name)) |> 
+  group_by(month_name, parameter) |>
+  summarise(
+    avg_availability = round(mean(data_pct, na.rm = TRUE), 2),
+    .groups = 'drop')
+
+monthly_dt <- format_availability_dt(
+  monthly_data_table,
+  col_names = c("Month", "Parameter", "Average Availability (%)"),
+  align_vec = c("l", "l", "c"))
+
+monthly_dt
+  
+```
+These interactive tables are broken up by yearly and monthly overall network data availability and by site.

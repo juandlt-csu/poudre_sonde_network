@@ -7,8 +7,8 @@ library(cdssr)
 library(tidyverse)
 library(plotly)
 
-start_dt = "2022-09-01"
-end_dt = "2022-12-31"
+start_dt = "2022-10-29"
+end_dt = "2022-11-12"
 
 canyon <- get_telemetry_ts(abbrev = "CLAFTCCO", start_date = start_dt, end_date = end_dt, timescale = "raw") # for PBD, Bellvue
 lincoln <- get_telemetry_ts(abbrev = "CLAFORCO", start_date = start_dt, end_date = end_dt, timescale = "raw") # for Salyer, udall, riverbend

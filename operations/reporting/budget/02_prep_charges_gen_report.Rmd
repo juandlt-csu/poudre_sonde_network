@@ -1,0 +1,186 @@
+---
+output: word_document
+---
+
+```{r project-select, include=FALSE}
+# User inputs required
+# - Set `project_select` below to `"PWQN"` or `"UCLP"`, then knit.
+# - Fill in the "General Outline of Work" bullet points below after knitting.
+###### ------ PROJECT SELECTOR ------ ######
+project_select <- "PWQN"   # or "UCLP"
+###### ------ Month/Year SELECTOR ------ ######
+month_select <- 7
+year_select  <- 2026
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+source(here::here("operations/reporting/budget/00_config.R"))
+
+package_loader <- function(x) { 
+  if(!x == "ross.wq.tools" & !x %in% installed.packages()) devtools::install_github(paste0("rossyndicate/", x))
+  if (!x %in% installed.packages()) install.packages(x)
+  library(x, character.only = TRUE)
+}
+lapply(c("flextable", "officer", "yaml", "ross.wq.tools", "dplyr", "readr", "stringr", "arrow", "patchwork"), package_loader)
+rm(package_loader)
+
+cfg <- get_project_cfg(project_select)
+mWater_creds <- read_yaml(mwater_creds_file)
+```
+
+# `r cfg$report_title` Summary of Work for `r paste(month_select, "/", year_select)`
+
+Prepared by: ROSSyndicate - Sam Struthers
+
+`r Sys.Date()`
+
+## General Outline of Work for `r paste(month_select, "/", year_select)`
+
+-   1
+
+-   2
+
+```{r prep_data, include=FALSE}
+# --- Tidy personnel ---
+hourly_rates <- load_hourly_rates(rates_file)
+
+senior_staff <- load_timeclock(reporting_xlsx, month_select, year_select, project = cfg$code) %>%
+  summarize_personnel_hours() %>%
+  cost_personnel(hourly_rates, exclude_categories = if (cfg$code == "PWQN") "Out of Scope" else character(0))
+
+# --- Tidy equipment & travel ---
+equipment <- load_equipment(reporting_xlsx, month_select, year_select, project = cfg$code) %>%
+  select(-project)
+travel    <- load_travel(reporting_xlsx, month_select, year_select, project = cfg$code) %>%
+  select(-project)
+
+# --- Summarize field notes ---
+field_summary   <- grab_field_notes(mWater_creds, cfg, month_select, year_select, full = FALSE)
+all_field_notes <- grab_field_notes(mWater_creds, cfg, month_select, year_select, full = TRUE)
+
+dir.create(dirname(path_field_summary(cfg, month_select, year_select)), showWarnings = FALSE, recursive = TRUE)
+write_csv(field_summary, path_field_summary(cfg, month_select, year_select))
+
+# --- Combine & format charges data ---
+all_data <- senior_staff %>%
+  select(-project) %>%
+  bind_rows(equipment) %>%
+  bind_rows(travel) %>%
+  arrange(factor(category, levels = unique(c(senior_staff$category, equipment$category, travel$category)))) %>%
+  mutate(staff = str_to_title(tolower(staff))) %>%
+  rename(Category = category, `Staff or Vendor` = staff,
+         Description = description, `Hours x Rate (if applicable)` = hours_rate, Cost = cost)
+
+# Export final charges CSV for recordkeeping
+dir.create(dirname(path_charges_final(cfg, month_select, year_select)), showWarnings = FALSE, recursive = TRUE)
+write_csv(all_data, path_charges_final(cfg, month_select, year_select))
+
+# --- Calculate IDC and Totals ---
+idc_cost <- sum(all_data$Cost[all_data$include != "No"]) * idc_rate
+
+final_summary <- tibble(
+  `Hours x Rate (if applicable)` = c(paste0("IDC (", idc_rate * 100, "%): "), "Total Cost: "),
+  Cost = c(idc_cost, sum(all_data$Cost[all_data$include != "No"]) + idc_cost),
+  include = c("Yes", "Yes")
+)
+
+final <- all_data %>%
+  bind_rows(final_summary) %>%
+  mutate(Cost = round(Cost, 2))
+```
+
+```{r print_charges_table}
+std_border <- fp_border_default(width = 1, color = "black")
+set_flextable_defaults(theme_fun = "theme_box", na_string = "")
+
+flextable(final, col_keys = c("Category", "Staff or Vendor", "Description",
+                               "Hours x Rate (if applicable)", "Cost")) %>%
+  italic(i = ~ include == "No", j = "Cost") %>%
+  bold(i = nrow(final)) %>%
+  merge_v(j = ~Category) %>%
+  merge_h(i = nrow(final) - 1) %>%
+  merge_h(i = nrow(final)) %>%
+  set_caption(caption = paste0("Summary of ", month_select, "/", year_select, " ",
+                                cfg$report_title, " costs", cfg$caption_suffix)) %>%
+  set_table_properties(width = 1, layout = "autofit")
+```
+
+## Summary of site visits for `r paste(month_select, "/", year_select)`
+
+```{r print_field_summary}
+if (sum(field_summary$`Site Visits`) > 0) {
+  flextable(field_summary) %>%
+    set_table_properties(width = 1, layout = "autofit")
+}
+```
+
+```{r data-summary-header, eval = (project_select != "UCLP"), results = 'asis', echo = FALSE}
+cat("## Data Summary for ", month_select, "/", year_select, "\n", sep = "")
+```
+
+```{r fig.width = 16, fig.height = 10, fig.units = "in", dpi = 300}
+if(project_select == "PWQN"){
+
+#Site names
+site_names <- tibble(site = c("pbd", "bellvue", "salyer", "udall", "riverbend", "cottonwood" ,"elc",  "archery", "riverbluffs"), 
+                     site_name = c("Canyon Mouth", "Tamasag", "Legacy", "Lincoln", "Timberline", "Prospect" ,"Boxelder",  "Archery", "River Bluffs"), 
+                     natural_name = c("Canyon Mouth", "Bellvue", "Salyer", "Udall", "Riverbend", "Cottonwood", "ELC", "Archery", "River Bluffs"), 
+                     site_color = c( "#000000" ,      "#185BB4","#009DD1","#00F5DC", "#00F0C0", "#00D684", "#00BD48",  "#00DB58", "#0FFF6B" ) )
+
+bg_colors_full <- c( "#185BB4", "#009DD1", "#00F5DC", "#00F0C0",
+                     "#00D684", "#00BD48", "#00DB58","#0FFF6B" 
+                     , "#000000" ) 
+#Site Order from up to downstream
+
+site_order = c("Canyon Mouth", "Bellvue", "Salyer", "Udall", "Riverbend", "Cottonwood", "ELC", "Archery", "River Bluffs")
+
+
+# Parameter labels
+labels <- tibble(param = c("Turbidity", "Specific Conductivity", "Depth", "Chl-a Fluorescence", "FDOM Fluorescence", "Temperature", "DO", 'pH', "Flow"),
+                 label = c("Turbidity (NTU)", "Specific Conductivity (uS/cm)", "Depth (ft)", "Chl-a Fluorescence (RFU)", "FDOM Fluorescence (RFU)", "Temperature (C)", "DO (mg/L)", 'pH', "Flow (cfs)"))
+
+params <- paste(labels$param, collapse = "|")
+
+
+  files <- list.files(here("data", "raw", "sensor","manual_data_verification",paste0(year_select, "_cycle"), "hydro_vu_pull", "flagged_data"), full.names = TRUE)%>%
+    grep(pattern = params, ., value = T)%>%
+    #remove extras
+    grep(pattern = "Level|MV", ., value = T, invert = T)
+
+# read in files
+sensor_data <- map_dfr(files, ~read_parquet(.x)) %>%
+  bind_rows()%>%
+  #convert to MST from UTC (if it is not already)
+  mutate(DT_round = with_tz(DT_round, tz = "MST"),
+         DT_join = as.character(DT_round))%>%
+  left_join(labels, by = c( "parameter" = "param"))%>%
+  left_join(site_names, by = "site")
+
+  sensor_data_clean <- sensor_data %>%
+    filter(
+      is.na(mal_flag), # remove any known malfunctions
+      !grepl("site visit|sv window", auto_flag), # remove site visit impacted data
+      !grepl("sonde unsubmerged", auto_flag),!grepl("sonde not employed", auto_flag), !grepl("sensor malfunction", auto_flag), # remove simple sensor flags
+      !(parameter == "Specific Conductivity" & mean > 3000), # remove instances of SC > 3000 uS/cm
+      !(parameter == "pH" & mean < 4.5), # remove pH < 4 (storage solution)
+      !(parameter == "pH" & mean > 11), # remove pH > 10 (sensor malfunction)
+      !(parameter == "Temperature" & mean < 0), # remove frozen instances
+      !(parameter == "Depth" & mean < 0), # remove negative depth values
+      !(parameter == "Temperature" & mean > 40), # remove instances of temperature > 30 C (sensor error)
+      !(parameter == "DO" & mean < 1), # remove DO < 1 mg/L (sensor error)
+      !(mean == 0) # remove instances of 0 values
+    ) %>%
+    mutate(mean = case_when(
+      parameter == "Turbidity" & mean > 1000 ~ 1000, # cap turbidity at 1000 NTU
+      parameter == "Depth" ~ mean / 0.3048, # convert depth to ft
+      TRUE ~ mean
+    ))%>%
+    mutate(
+      doy = yday(DT_round)
+    )
+
+generate_monthly_boxplot_summary(sensor_data = sensor_data_clean, month = month_select, year = year_select)
+}
+```
+

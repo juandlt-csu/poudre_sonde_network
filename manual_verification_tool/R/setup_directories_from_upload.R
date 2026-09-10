@@ -1,14 +1,12 @@
 setup_directories_from_upload <- function(uploaded_file_path, timezone = "MST"){
 
-  #for testing:setwd("~/Documents/fork_yeah/poudre_sonde_network/manual_verification_tool/ver_tool_v1")
-
-  testing_path = here("manual_verification_tool", "ver_tool_v1")
-  data_path = here("manual_verification_tool",  "data")
-  all_path = here("manual_verification_tool",  "data", "all_data_directory")
-  pre_verification_path = here("manual_verification_tool", "data", "pre_verification_directory")
-  intermediary_path = here("manual_verification_tool", "data", "intermediary_directory")
-  verified_path = here("manual_verification_tool", "data", "verified_directory")
-  raw_data_path = here("manual_verification_tool", "data", "raw_data")
+  testing_path = here("ver_tool_v1")
+  data_path = in_progress_path
+  all_path = all_data_path
+  pre_verification_path_local = pre_verification_path
+  intermediary_path_local = intermediary_path
+  verified_path_local = verified_path
+  raw_data_path_local = raw_data_path
 
   uploaded_file_type <- tools::file_ext(uploaded_file_path)
   org_file_type <- uploaded_file_type
@@ -46,8 +44,8 @@ setup_directories_from_upload <- function(uploaded_file_path, timezone = "MST"){
         file.copy(uploaded_file_path, raw_data_path)
       }
     }
-    if(!dir.exists(here("manual_verification_tool", "data", "meta"))){
-      dir.create(here("manual_verification_tool", "data", "meta"))
+    if(!dir.exists(meta_path)){
+      dir.create(meta_path)
     }
 
     #if a user uploads a zip file, the data will be loaded from the zip file. If there is no data in the all path, check the raw data folder for a file to fill the all path
@@ -93,13 +91,13 @@ setup_directories_from_upload <- function(uploaded_file_path, timezone = "MST"){
     if(!dir.exists(raw_data_path)){
       dir.create(raw_data_path)
       if(org_file_type != "zip"){
-        raw_data_filename <- here(raw_data_path, paste0("raw_data.", org_file_type))
+        raw_data_filename <- file.path(raw_data_path, paste0("raw_data.", org_file_type))
 
         file.copy(uploaded_file_path, raw_data_filename)
       }
     }
-    if(!dir.exists(here("manual_verification_tool", "data", "meta"))){
-      dir.create(here("manual_verification_tool", "data", "meta"))
+    if(!dir.exists(meta_path)){
+      dir.create(meta_path)
     }
 
   #this will read in the file based on its type and check to make sure there is no missing columns
@@ -190,7 +188,7 @@ setup_directories_from_upload <- function(uploaded_file_path, timezone = "MST"){
     timestamp <- format(Sys.time(), "%Y%m%d_%H%M%S")
     data_hash <- digest::digest(x)
     new_filename <- glue("{idx}_{timestamp}_{data_hash}.parquet")
-    write_parquet(x, here(all_path, new_filename))  # Ensure you use new_filename, not idx
+    write_parquet(x, file.path(all_path, new_filename))  # Ensure you use new_filename, not idx
   })
 
   R.utils::copyDirectory(all_path, pre_verification_path)
