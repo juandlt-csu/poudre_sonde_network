@@ -122,6 +122,7 @@ do_prepped <- do_data %>%
     v <- visits$visit_DT[visits$site == key$site]
     nearest <- map_int(v, function(t) {
       #Find the nearest site visit within 180 minutes (3 hours)
+#Find the nearest site visit within 180 minutes (3 hours)
       d <- as.numeric(abs(difftime(df$DT_round, t, units = "mins")))
       if (min(d) > 180) NA_integer_ else which.min(d)
     })
