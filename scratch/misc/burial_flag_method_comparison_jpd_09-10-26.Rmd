@@ -19,11 +19,11 @@ precision and recall.
 
 The water year regimes we built these tools in had rarely if ever seen DO
 levels lower than 5 mg/L that were not burials, but 2026 has been an
-extremely anomalous year in terms of precipitation. As a result we have seen
+extremely anomalous year in terms of precipitation and elevated water temperatures. As a result we have seen
 realistic values lower than 5 mg/L that trigger our DO burial heuristics and
 flag large swaths of correct data. Given that these functions are used in
 live environments with users who rely on the correctness of our flagging
-methods, we want to correct this behavior.
+methods, we want to correct this behavior. In particular, we want to reduce "false positives" with this flag (ie good data being flagged as a burial)
 
 # Data Loading and Environment Initialization
 
@@ -37,7 +37,7 @@ library(here)
 library(slider)
 ```
 
-We use 2023 through 2026. For 2023 to 2025 we use the published HydroShare
+To explore new flagging functions, we will use data collected in 2023 through 2026. For 2023 to 2025 we use the published HydroShare
 `raw` files, which carry `user_qc_flag` (the human verification outcome, our
 ground truth) alongside `auto_qc_flag` (what the current auto-QAQC produced).
 2026 is not verified yet, so we pull it from the in-progress
@@ -121,6 +121,7 @@ do_prepped <- do_data %>%
   group_modify(function(df, key) {
     v <- visits$visit_DT[visits$site == key$site]
     nearest <- map_int(v, function(t) {
+      #Find the nearest site visit within 180 minutes (3 hours)
       d <- as.numeric(abs(difftime(df$DT_round, t, units = "mins")))
       if (min(d) > 180) NA_integer_ else which.min(d)
     })
@@ -145,7 +146,7 @@ do_split <- do_prepped %>%
 # Method comparison
 
 Here we compare the original method with an updated version of the method
-that Sam came up with. I have slightly tweaked the method to increase
+that Sam came up with. I have slightly tweaked the method to reduce
 the function's false positive rate (reduce the amount of flags we put on 
 data that should not be flagged).
 
@@ -236,7 +237,7 @@ its forward half, so a point sitting in the normal overnight low can end up
 with a trailing-only window that averages below 5 mg/L. That flags the last
 few points before a site visit as burial when nothing is wrong. With the
 tweak, `low_center` can flag on its own only when its +/- 12 hour window
-actually holds data on both sides (at least 80% of the 720 minute half-span,
+actually holds data on both sides (`center_well_covered`, at least 80% of the 720 minute half-span,
 before and after the point, measured in time). Otherwise it can only back up
 one of the other two signals. The flag becomes
 `low_right | (static_right & low_center) | (low_center & center_well_covered)`.
@@ -325,7 +326,7 @@ method uses it.
 | DO below 5 mg/L | a buried sensor loses contact with moving, oxygenated water and reads too low | yes (per point) | yes (window mean) |
 | Low DO persists for ~24 h | a real burial lasts; transient noise does not | yes (count of interference points) | yes (window mean) |
 | Diel cycle is gone (flat signal) | burial removes the daily photosynthesis and respiration swing in DO | no | yes (`static_right`) |
-| Split the series at each site visit | a cleaning resets the sensor, so data on either side should not be pooled | no | yes |
+| Split the series at each site visit | a cleaning removes sediment from the sensor, so data on either side should not be pooled | no | yes |
 | Centered window, not just trailing | a centered window catches the onset of a burial about 12 h earlier | no | yes (`low_center`) |
 | Ignore a centered window missing half its data | a half-empty window near a visit or gap should not flag on its own | no | yes (my tweak) |
 | Windows measured in time, not observations | a data gap should not silently shrink the real time span the window covers | no | yes |
