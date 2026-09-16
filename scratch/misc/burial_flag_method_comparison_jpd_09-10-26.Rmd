@@ -238,7 +238,8 @@ with a trailing-only window that averages below 5 mg/L. That flags the last
 few points before a site visit as burial when nothing is wrong. With the
 tweak, `low_center` can flag on its own only when its +/- 12 hour window
 actually holds data on both sides (`center_well_covered`, at least 80% of the 720 minute half-span,
-before and after the point, measured in time). Otherwise it can only back up
+tweak, `low_center` can flag on its own only when its +/- 12 hour window
+actually holds data on both sides (`center_well_covered`, at least 80% of the 720 minute half-span,
 one of the other two signals. The flag becomes
 `low_right | (static_right & low_center) | (low_center & center_well_covered)`.
 
