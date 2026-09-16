@@ -10,7 +10,7 @@ interference heuristics we came up with are too coarse to tell the
 difference between data that is just unusual and data that actually
 indicates a sonde burial. The heuristics check for two patterns in the DO
 signal and tag either one as "DO interference". The first is spikes in the
-data, which serve as an analog for increased variability in the signal. The
+data, which serve as an analog for increased variability in the signal. This type of signal may be indicative of a partial burial as sediment may fill in near the sensor and periodically flush out.The
 second is "unrealistic" lows in the data, a depressed signal that is either
 not plausible or only possible as a reading because the DO sensor is buried
 and has limited access to moving oxygenated water. By combining these two
